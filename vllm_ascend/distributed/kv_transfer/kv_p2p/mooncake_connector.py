@@ -80,6 +80,7 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+STAGING_MSG = b"staging_msg"
 
 
 # A busy peer can otherwise keep a global executor worker forever when the
@@ -255,6 +256,7 @@ class KVCacheSendingThread(threading.Thread):
         ready_event: threading.Event,
         kv_caches: dict[str, Any],
         pcp_rank: int,
+        staging_service: Any = None,
     ):
         super().__init__(daemon=True, name="KVCacheSendingThread")
         self.tp_rank = tp_rank
@@ -271,6 +273,7 @@ class KVCacheSendingThread(threading.Thread):
         self.kv_caches = kv_caches
         self.pcp_rank = pcp_rank
         self.port_send_num: dict[str, int] = {}
+        self.staging_service = staging_service
 
         self.task_tracker = KVCacheTaskTracker()
 
@@ -384,10 +387,12 @@ class KVCacheSendingThread(threading.Thread):
                             # If the socket is not ready, retry sending.
                             logger.debug("Socket not ready, retrying to send ACK for request %s", msg[1])
                             time.sleep(0.01)
+                elif msg[0] == STAGING_MSG:
+                    self._handle_staging_msg(sock, identity, msg[1])
                 else:
                     logger.error(
                         "Connection listener received unexpected message type. "
-                        "Expected: GET_META_MSG or DONE_RECVING_MSG. "
+                        "Expected: GET_META_MSG, DONE_RECVING_MSG or STAGING_MSG. "
                         "Actual: %s. "
                         "Full message: %s. "
                         "Check: Verify message protocol implementation.",
@@ -404,6 +409,37 @@ class KVCacheSendingThread(threading.Thread):
                     type(e).__name__,
                     e,
                 )
+
+    def _handle_staging_msg(self, sock: zmq.Socket, identity: bytes, payload: bytes) -> None:
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+            PrepareReadMsg,
+            ReadAckMsg,
+            StagingMsgType,
+            decode_msg,
+            encode_msg,
+            msg_type_of,
+        )
+
+        if self.staging_service is None:
+            logger.error("Received STAGING_MSG but staging is not enabled on this P-side")
+            sock.send_multipart((identity, b"", b"ERR_NO_STAGING"))
+            return
+
+        msg_type = msg_type_of(payload)
+        if msg_type == StagingMsgType.PREPARE_READ:
+            msg = decode_msg(payload)
+            if not isinstance(msg, PrepareReadMsg):
+                raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
+            sock.send_multipart((identity, b"", encode_msg(self.staging_service.handle_prepare_read(msg))))
+        elif msg_type == StagingMsgType.READ_ACK:
+            msg = decode_msg(payload)
+            if not isinstance(msg, ReadAckMsg):
+                raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
+            self.staging_service.handle_read_ack(msg)
+            sock.send_multipart((identity, b"", b"ACK"))
+        else:
+            logger.error("Unexpected staging message type: %s", msg_type)
+            sock.send_multipart((identity, b"", b"ERR_UNKNOWN_TYPE"))
 
 
 class KVCacheRecvingThread(threading.Thread):
@@ -426,6 +462,8 @@ class KVCacheRecvingThread(threading.Thread):
         prefill_pp_layer_partition: str | None = None,
         kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]] | None = None,
         block_size_scale: list[list[int]] | None = None,
+        staging_coordinator: Any = None,
+        staging_enabled: bool = False,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
         self.tp_rank = tp_rank
@@ -435,6 +473,8 @@ class KVCacheRecvingThread(threading.Thread):
         self.local_handshake_port = local_handshake_port
         self.side_channel_port = side_channel_port
         self.engine = engine
+        self.staging_coordinator = staging_coordinator
+        self.staging_enabled = staging_enabled
         if ready_event is None:
             ready_event = threading.Event()
         self.ready_event = ready_event
@@ -959,14 +999,32 @@ class KVCacheRecvingThread(threading.Thread):
             dst_list,
             length_list,
         )
-        ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
-        if ret < 0:
-            logger.error(
-                "Mooncake transfer failed for request. remote_request_id=%s, ret=%d. ",
-                req_meta["remote_request_id"],
-                ret,
+        if self.staging_enabled and self.staging_coordinator is not None:
+            logger.info(
+                "Using STAGING path: %d entries, total %d bytes, session=%s, request=%s",
+                len(src_list),
+                sum(length_list),
+                session_id,
+                remote_request_id,
             )
-            raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+            self._transfer_via_staging(
+                req_meta,
+                session_id,
+                remote_host,
+                remote_handshake_port,
+                src_list,
+                dst_list,
+                length_list,
+            )
+        else:
+            ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+            if ret < 0:
+                logger.error(
+                    "Mooncake transfer failed for request. remote_request_id=%s, ret=%d. ",
+                    req_meta["remote_request_id"],
+                    ret,
+                )
+                raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
 
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
@@ -1042,6 +1100,7 @@ class KVCacheRecvingThread(threading.Thread):
                     num_reformat_blocks,
                     layer_indices,
                 )
+
                 group_kv_caches = self._get_group_kv_caches(group_idx, layer_indices)
                 if not group_kv_caches:
                     continue
@@ -1078,6 +1137,109 @@ class KVCacheRecvingThread(threading.Thread):
                     need_nz_cache,
                     group_kv_caches,
                 )
+
+    def _transfer_via_staging(
+        self,
+        req_meta: dict[str, Any],
+        session_id: str,
+        remote_host: str,
+        remote_handshake_port: int,
+        src_list: list[int],
+        dst_list: list[int],
+        length_list: list[int],
+    ) -> None:
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.adapter import plan_from_flat_entries
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+            PackReadyMsg,
+            PrepareReadMsg,
+            ReadAckMsg,
+            StagingErrorMsg,
+            StagingMsgType,
+            decode_msg,
+            encode_msg,
+            msg_type_of,
+        )
+
+        remote_request_id = req_meta["remote_request_id"]
+        # In _transfer_kv_cache_all_groups, src_list = local (D) addresses and
+        # dst_list = remote (P) addresses.  For the staging planner the
+        # semantics are reversed: src = P-side KV cache (gather source) and
+        # dst = D-side KV cache (scatter destination).
+        plan = plan_from_flat_entries(
+            dst_list,
+            src_list,
+            length_list,
+            request_id=remote_request_id,
+            peer_session=session_id,
+            chunk_capacity=self.staging_coordinator.pool.slot_capacity,
+        )
+
+        logger.info(
+            "Staging plan: transfer_id=%s, direct_runs=%d, packed_chunks=%d, entries=%d",
+            remote_request_id,
+            len(plan.direct_runs),
+            len(plan.packed_chunks),
+            len(src_list),
+        )
+
+        def direct_transfer(s_addrs: list[int], d_addrs: list[int], lens: list[int]) -> int:
+            return self.engine.batch_transfer_sync_read(session_id, s_addrs, d_addrs, lens)
+
+        def prepare_read(msg: PrepareReadMsg):
+            logger.info(
+                "D-side PREPARE_READ: transfer_id=%s, chunk_id=%d, total_bytes=%d",
+                msg.transfer_id, msg.chunk_id, msg.total_bytes,
+            )
+            sock = self._get_remote_socket(remote_host, remote_handshake_port)
+            try:
+                ensure_zmq_send(sock, self.encoder.encode((STAGING_MSG, encode_msg(msg))), f"{remote_host}:{remote_handshake_port}")
+                response = ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
+                if response == b"ERR_NO_STAGING":
+                    return StagingErrorMsg(msg.transfer_id, msg.chunk_id, 2, "peer has no staging")
+                decoded = decode_msg(response)
+                if msg_type_of(response) == StagingMsgType.ERROR:
+                    if not isinstance(decoded, StagingErrorMsg):
+                        raise ValueError(f"Unexpected staging error: {type(decoded).__name__}")
+                    return decoded
+                if not isinstance(decoded, PackReadyMsg):
+                    raise ValueError(f"Unexpected staging response: {type(decoded).__name__}")
+                logger.info(
+                    "D-side PACK_READY: transfer_id=%s, chunk_id=%d, slot_addr=0x%x",
+                    decoded.transfer_id, decoded.chunk_id, decoded.slot_addr,
+                )
+                return decoded
+            finally:
+                self._return_remote_socket(sock, remote_host, remote_handshake_port)
+
+        def rdma_read(local_dst: int, remote_src: int, nbytes: int) -> int:
+            return self.engine.batch_transfer_sync_read(session_id, [local_dst], [remote_src], [nbytes])
+
+        def send_ack(msg: ReadAckMsg) -> None:
+            logger.info(
+                "D-side READ_ACK: transfer_id=%s, chunk_id=%d, success=%s",
+                msg.transfer_id, msg.chunk_id, msg.success,
+            )
+            sock = self._get_remote_socket(remote_host, remote_handshake_port)
+            try:
+                ensure_zmq_send(sock, self.encoder.encode((STAGING_MSG, encode_msg(msg))), f"{remote_host}:{remote_handshake_port}")
+                ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
+            finally:
+                self._return_remote_socket(sock, remote_host, remote_handshake_port)
+
+        result = self.staging_coordinator.execute(
+            plan,
+            transfer_id=remote_request_id,
+            direct_transfer=direct_transfer,
+            prepare_read=prepare_read,
+            rdma_read=rdma_read,
+            send_ack=send_ack,
+        )
+        logger.info(
+            "Staging transfer done: transfer_id=%s, success=%s",
+            remote_request_id, result.success,
+        )
+        if not result.success:
+            raise RuntimeError(f"Staged transfer failed for {remote_request_id}: {result.error}")
 
     @torch.no_grad()
     def reformat_kv_cache_hybrid_linear_torch(
@@ -2395,6 +2557,8 @@ class MooncakeConnectorWorker:
 
         validate_register_region_count(register_regions)
         global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+        for i, (ptr, length) in enumerate(zip(register_regions.ptrs, register_regions.lengths)):
+            logger.info("TE register_buffer[%d]: ptr=0x%x, end=0x%x, len=%d", i, ptr, ptr + length, length)
 
         logger.debug(
             "Mooncake register kv caches metadata: kv_group2layeridx=%s, kv_caches_base_addr=%s, "
@@ -2425,6 +2589,14 @@ class MooncakeConnectorWorker:
         )
         self.xfer_handshake_metadata = metadata
 
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.budget import staging_config_from_env
+
+        staging_service = None
+        staging_coordinator = None
+        staging_enabled = staging_config_from_env().enabled
+        if staging_enabled:
+            staging_service, staging_coordinator = self._create_staging_components(kv_caches)
+
         ready_event = threading.Event()
         if self.kv_role == "kv_producer":
             self.kv_send_thread = KVCacheSendingThread(
@@ -2438,6 +2610,7 @@ class MooncakeConnectorWorker:
                 ready_event,
                 self.kv_caches,
                 self.pcp_rank,
+                staging_service=staging_service,
             )
             self.kv_send_thread.start()
         else:
@@ -2459,6 +2632,8 @@ class MooncakeConnectorWorker:
                 self._prefill_pp_layer_partition,
                 self.kv_group2layeridx,
                 self.block_size_scale,
+                staging_coordinator=staging_coordinator,
+                staging_enabled=staging_enabled,
             )
             self.kv_recv_thread.start()
         start_wait_time = time.time()
@@ -2470,6 +2645,58 @@ class MooncakeConnectorWorker:
             if time.time() - start_wait_time > 5 * 60:
                 raise RuntimeError("Timeout waiting for KV Cache thread to be ready.")
             time.sleep(3)
+
+    def _create_staging_components(self, kv_caches: dict[str, torch.Tensor]) -> tuple[Any, Any]:
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.budget import staging_config_from_env
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.d_coordinator import DecodeStagingCoordinator
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.p_service import PrefillStagingService
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
+
+        config = staging_config_from_env()
+        first_value = next(iter(kv_caches.values()))
+        first_tensor = self._as_kv_cache_tuple(first_value)[0]
+        device = first_tensor.device
+
+        # Build kv_regions with storage-aware merging so that regions cover
+        # the full address range reachable by block-stride addressing.
+        # Without merging, individual tensor views can be narrower than the
+        # memory range that D-side PREPARE_READ addresses span, causing
+        # "source range is outside registered KV regions" validation failures.
+        merged = collect_storage_merged_register_regions(kv_caches)
+        kv_regions: list[tuple[int, torch.Tensor]] = []
+        for ptr, length in zip(merged.ptrs, merged.lengths):
+            placeholder = torch.empty(length, dtype=torch.int8, device="cpu")
+            kv_regions.append((ptr, placeholder))
+        kv_regions.sort(key=lambda region: region[0])
+
+        pool = StagingPool(
+            num_slots=config.num_slots,
+            slot_capacity=config.slot_capacity,
+            alignment=config.alignment,
+            device=str(device),
+        )
+        pool.register(self.engine)
+        dummy_tensor = torch.empty(0, dtype=torch.int8, device=device)
+        if self.kv_role == "kv_producer":
+            component = PrefillStagingService(
+                pool=pool,
+                kv_tensor=dummy_tensor,
+                kv_base_addr=0,
+                kv_regions=kv_regions,
+            )
+            logger.info("P-side staging enabled: %d slots x %d bytes, device=%s", config.num_slots, config.slot_capacity, device)
+            for i, (base, t) in enumerate(kv_regions):
+                region_len = t.numel() * t.element_size()
+                logger.info("P-side kv_region[%d]: base=0x%x, end=0x%x, len=%d", i, base, base + region_len, region_len)
+        else:
+            component = DecodeStagingCoordinator(
+                pool=pool,
+                dst_tensor=dummy_tensor,
+                dst_base_addr=0,
+                dst_regions=kv_regions,
+            )
+            logger.info("D-side staging enabled: %d slots x %d bytes, device=%s", config.num_slots, config.slot_capacity, device)
+        return (component, None) if self.kv_role == "kv_producer" else (None, component)
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_sending = (

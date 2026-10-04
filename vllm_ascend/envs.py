@@ -27,6 +27,13 @@ from typing import Any
 
 # begin-env-vars-definition
 
+
+def _strict_binary_env(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default)
+    if value not in {"0", "1"}:
+        raise ValueError(f"{name} must be either '0' or '1', got {value!r}")
+    return value == "1"
+
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -110,6 +117,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    "VLLM_ASCEND_STAGING_ENABLED": lambda: _strict_binary_env("VLLM_ASCEND_STAGING_ENABLED"),
+    "VLLM_ASCEND_STAGING_NUM_SLOTS": lambda: int(os.getenv("VLLM_ASCEND_STAGING_NUM_SLOTS", "2")),
+    "VLLM_ASCEND_STAGING_SLOT_CAPACITY_MIB": lambda: int(
+        os.getenv("VLLM_ASCEND_STAGING_SLOT_CAPACITY_MIB", "16")
+    ),
 }
 
 # end-env-vars-definition

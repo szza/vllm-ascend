@@ -82,6 +82,7 @@ if TYPE_CHECKING:
 
 DONE_SENDING_MSG = b"done_sending_msg"
 FAILED_SENDING_MSG = b"failed_sending_msg"
+STAGING_MSG = b"staging_msg"
 
 
 @dataclass
@@ -224,6 +225,12 @@ class KVCacheSendingLayerThread(threading.Thread):
         enable_c8_quant: bool,
         resharding_stream: torch.npu.Stream,
         callback_func: Callable[..., None] = lambda x: None,
+        staging_coordinator: Any = None,
+        staging_enabled: bool = False,
+        get_remote_socket_fn: Callable | None = None,
+        return_remote_socket_fn: Callable | None = None,
+        remote_poller: Any = None,
+        zmq_encoder: Any = None,
     ):
         super().__init__(daemon=True, name="KVCacheSendingLayerThread")
         self.engine = engine
@@ -262,6 +269,12 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.enable_c8_quant = enable_c8_quant
         self.ready_event = ready_event
         self.callback_func = callback_func
+        self.staging_coordinator = staging_coordinator
+        self.staging_enabled = staging_enabled
+        self._get_remote_socket = get_remote_socket_fn
+        self._return_remote_socket = return_remote_socket_fn
+        self._remote_poller = remote_poller
+        self._zmq_encoder = zmq_encoder
 
     def run(self):
         local_rank = get_world_group().local_rank
@@ -494,9 +507,21 @@ class KVCacheSendingLayerThread(threading.Thread):
         for session_id, transfer_meta in session_meta.items():
             if len(transfer_meta.src) > 0:
                 req_start_time = time.perf_counter()
-                ret = self.engine.batch_transfer_sync_write(
-                    session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
-                )
+                if self.staging_enabled and self.staging_coordinator is not None:
+                    logger.info(
+                        "Layer%d using STAGING path: %d entries, total %d bytes, session=%s",
+                        send_task.layer_idx,
+                        len(transfer_meta.src),
+                        sum(transfer_meta.length),
+                        session_id,
+                    )
+                    ret = self._transfer_via_staging(
+                        session_id, send_task, transfer_meta,
+                    )
+                else:
+                    ret = self.engine.batch_transfer_sync_write(
+                        session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
+                    )
                 if ret < 0:
                     logger.error(
                         "Mooncake transfer failed for send requests. req_ids=%s, destination=%s, ret=%d. ",
@@ -526,6 +551,102 @@ class KVCacheSendingLayerThread(threading.Thread):
                             else:
                                 self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
 
+    def _transfer_via_staging(
+        self,
+        session_id: str,
+        send_task: SendTask,
+        transfer_meta: TransferMeta,
+    ) -> int:
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.adapter import (
+            plan_from_flat_entries,
+        )
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+            StagingErrorMsg,
+            decode_msg,
+            encode_msg,
+        )
+
+        first_req_id = transfer_meta.req_ids[0] if transfer_meta.req_ids else "unknown"
+        first_req_meta = send_task.send_request.get(first_req_id)
+        if first_req_meta is None:
+            first_req_meta = next(iter(send_task.send_request.values()))
+        remote_host = first_req_meta.remote_host
+        remote_port = first_req_meta.remote_port
+
+        plan = plan_from_flat_entries(
+            src_list=transfer_meta.src,
+            dst_list=transfer_meta.dst,
+            length_list=transfer_meta.length,
+            request_id=first_req_id,
+            peer_session=session_id,
+        )
+
+        logger.info(
+            "Staging plan: transfer_id=%s, direct_runs=%d, packed_chunks=%d, entries=%d",
+            f"{first_req_id}_L{send_task.layer_idx}",
+            len(plan.direct_runs),
+            len(plan.packed_chunks),
+            len(transfer_meta.src),
+        )
+
+        if not plan.packed_chunks and not plan.direct_runs:
+            return 0
+
+        def direct_write(src_addrs, dst_addrs, lengths):
+            return self.engine.batch_transfer_sync_write(session_id, src_addrs, dst_addrs, lengths)
+
+        def prepare_write(msg):
+            sock = self._get_remote_socket(remote_host, remote_port)
+            try:
+                ensure_zmq_send(
+                    sock,
+                    self._zmq_encoder.encode((STAGING_MSG, encode_msg(msg))),
+                    f"{remote_host}:{remote_port}",
+                )
+                response_bytes = ensure_zmq_recv(
+                    sock, self._remote_poller,
+                    f"{remote_host}:{remote_port}",
+                )
+                return decode_msg(response_bytes)
+            finally:
+                self._return_remote_socket(sock, remote_host, remote_port)
+
+        def rdma_write(p_addr, d_addr, nbytes):
+            return self.engine.batch_transfer_sync_write(session_id, [p_addr], [d_addr], [nbytes])
+
+        def send_write_done(msg):
+            sock = self._get_remote_socket(remote_host, remote_port)
+            try:
+                ensure_zmq_send(
+                    sock,
+                    self._zmq_encoder.encode((STAGING_MSG, encode_msg(msg))),
+                    f"{remote_host}:{remote_port}",
+                )
+                ensure_zmq_recv(
+                    sock, self._remote_poller,
+                    f"{remote_host}:{remote_port}",
+                )
+            finally:
+                self._return_remote_socket(sock, remote_host, remote_port)
+
+        transfer_id = f"{first_req_id}_L{send_task.layer_idx}"
+        result = self.staging_coordinator.execute(
+            plan,
+            transfer_id,
+            direct_write=direct_write,
+            prepare_write=prepare_write,
+            rdma_write=rdma_write,
+            send_write_done=send_write_done,
+        )
+        if not result.success:
+            logger.error(
+                "Staged transfer failed: transfer_id=%s, error=%s",
+                transfer_id,
+                result.error,
+            )
+            return -1
+        return 0
+
 
 class KVCacheRecvingLayerThread(threading.Thread):
     def __init__(
@@ -537,6 +658,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         local_engine_id: str,
         metadata: MooncakeAgentMetadata,
         ready_event: threading.Event,
+        write_service: Any = None,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingLayerThread")
         self.tp_rank = tp_rank
@@ -551,6 +673,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.task_tracker = dict[str, int]()
         self.ready_event = ready_event
         self.metadata = metadata
+        self.write_service = write_service
 
     def get_and_clear_done_requests(self) -> set[str]:
         """
@@ -641,6 +764,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         logger.error("Got FAILED_SENDING_MSG for request. request_id=%s. ", msg[1])
                         self.update_failed_task(request_id)
                         sock.send_multipart((identity, b"", b"ACK"))
+                    elif msg[0] == STAGING_MSG:
+                        self._handle_staging_msg(sock, identity, msg[1])
                     else:
                         logger.error(
                             "Unexpected message type: %s. expected GET_META_MSG or DONE_RECVING_MSG. msg=%s",
@@ -651,6 +776,48 @@ class KVCacheRecvingLayerThread(threading.Thread):
                     logger.error(
                         "Failed to decode message. type=%s, error=%s. context=decoding payload", type(e).__name__, e
                     )
+
+    def _handle_staging_msg(self, sock, identity, staging_data: bytes) -> None:
+        if self.write_service is None:
+            logger.error("Received STAGING_MSG but write_service is not configured")
+            sock.send_multipart((identity, b"", b"ACK"))
+            return
+
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+            StagingMsgType,
+            decode_msg,
+            encode_msg,
+            msg_type_of,
+        )
+
+        try:
+            msg_type = msg_type_of(staging_data)
+            msg = decode_msg(staging_data)
+
+            if msg_type == StagingMsgType.PREPARE_WRITE:
+                logger.info(
+                    "D-side PREPARE_WRITE: transfer_id=%s, chunk_id=%d, total_bytes=%d",
+                    msg.transfer_id, msg.chunk_id, msg.total_bytes,
+                )
+                response = self.write_service.handle_prepare_write(msg)
+                logger.info(
+                    "D-side WRITE_READY: transfer_id=%s, slot_addr=0x%x",
+                    msg.transfer_id, response.slot_addr if hasattr(response, 'slot_addr') else 0,
+                )
+                sock.send_multipart((identity, b"", encode_msg(response)))
+            elif msg_type == StagingMsgType.WRITE_DONE:
+                logger.info(
+                    "D-side WRITE_DONE: transfer_id=%s, chunk_id=%d, success=%s",
+                    msg.transfer_id, msg.chunk_id, msg.success,
+                )
+                self.write_service.handle_write_done(msg)
+                sock.send_multipart((identity, b"", b"ACK"))
+            else:
+                logger.error("Unexpected staging message type: %s", msg_type)
+                sock.send_multipart((identity, b"", b"ACK"))
+        except Exception as e:
+            logger.error("Failed to handle staging message: %s", e)
+            sock.send_multipart((identity, b"", b"ACK"))
 
 
 class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
@@ -1356,6 +1523,9 @@ class MooncakeLayerwiseConnectorWorker:
             te_rpc_port=self.te_rpc_port,
             layer_metadata=self.layer_metadata,
         )
+
+        staging_coordinator, write_service = self._create_staging_components(kv_caches)
+
         if self.vllm_config.kv_transfer_config.is_kv_producer:
             ready_event = threading.Event()
             self.kv_send_layer_thread = KVCacheSendingLayerThread(
@@ -1379,6 +1549,12 @@ class MooncakeLayerwiseConnectorWorker:
                 enable_c8_quant=self.enable_c8_quant,
                 resharding_stream=self.resharding_stream,
                 callback_func=self.send_done_send_signal,
+                staging_coordinator=staging_coordinator,
+                staging_enabled=staging_coordinator is not None,
+                get_remote_socket_fn=self._get_remote_socket,
+                return_remote_socket_fn=self._return_remote_socket,
+                remote_poller=self.remote_poller,
+                zmq_encoder=self.encoder,
             )
             self.kv_send_layer_thread.start()
             ready_event.wait()
@@ -1393,9 +1569,88 @@ class MooncakeLayerwiseConnectorWorker:
                 self.engine_id,
                 metadata,
                 ready_event,
+                write_service=write_service,
             )
             self.kv_recv_layer_thread.start()
             ready_event.wait()
+
+    def _create_staging_components(self, kv_caches: dict[str, torch.Tensor]):
+        """Create staging pool + coordinator/service if staging is enabled.
+
+        Returns (coordinator, write_service) — exactly one is non-None
+        depending on role, or both None if staging is disabled.
+        """
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.budget import (
+            staging_config_from_env,
+        )
+
+        config = staging_config_from_env()
+        if not config.enabled:
+            return None, None
+
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.d_write_service import (
+            DecodeWriteService,
+        )
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.p_write_coordinator import (
+            PrefillWriteCoordinator,
+        )
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import (
+            StagingPool,
+        )
+
+        kv_regions: list[tuple[int, torch.Tensor]] = []
+        seen_ptrs: set[int] = set()
+        for _layer_name, kv_cache_tuple in kv_caches.items():
+            if not isinstance(kv_cache_tuple, (list, tuple)):
+                kv_cache_tuple = [kv_cache_tuple]
+            for tensor in kv_cache_tuple:
+                ptr = tensor.data_ptr()
+                if ptr not in seen_ptrs:
+                    seen_ptrs.add(ptr)
+                    flat = tensor.view(-1).view(torch.int8)
+                    kv_regions.append((ptr, flat))
+        kv_regions.sort(key=lambda x: x[0])
+
+        if not kv_regions:
+            logger.warning("No KV regions found for staging, disabling")
+            return None, None
+
+        dummy_tensor = kv_regions[0][1]
+        dummy_addr = kv_regions[0][0]
+
+        pool = StagingPool(
+            num_slots=config.num_slots,
+            slot_capacity=config.slot_capacity,
+        )
+        pool.register(self.engine)
+        logger.info(
+            "Staging pool created: slots=%d, capacity=%d MiB",
+            config.num_slots,
+            config.slot_capacity // (1024 * 1024),
+        )
+
+        coordinator = None
+        write_service = None
+
+        if self.vllm_config.kv_transfer_config.is_kv_producer:
+            coordinator = PrefillWriteCoordinator(
+                pool=pool,
+                src_tensor=dummy_tensor,
+                src_base_addr=dummy_addr,
+                src_regions=kv_regions,
+            )
+            logger.info("PrefillWriteCoordinator created for staging WRITE mode")
+
+        if self.vllm_config.kv_transfer_config.is_kv_consumer:
+            write_service = DecodeWriteService(
+                pool=pool,
+                kv_tensor=dummy_tensor,
+                kv_base_addr=dummy_addr,
+                kv_regions=kv_regions,
+            )
+            logger.info("DecodeWriteService created for staging WRITE mode")
+
+        return coordinator, write_service
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_recving = (
@@ -1865,6 +2120,17 @@ class MooncakeLayerwiseConnectorWorker:
             )
             self.remote_poller.register(sock, zmq.POLLIN)  # type: ignore
             return sock
+
+    def _return_remote_socket(
+        self,
+        sock: zmq.Socket,  # type: ignore
+        remote_host: str,
+        remote_handshake_port: int,
+    ) -> None:
+        """Return the remote socket to the pool."""
+        remote_path = make_zmq_path("tcp", remote_host, remote_handshake_port)
+        with self.remote_sockets_lock:
+            self.remote_sockets[remote_path].append(sock)
 
     def update_decoder_info(self, req_id, req_meta: ReqMeta):
         if (
