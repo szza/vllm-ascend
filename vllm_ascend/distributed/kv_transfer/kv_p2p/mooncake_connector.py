@@ -1903,6 +1903,40 @@ class KVCacheRecvingThread(threading.Thread):
             )
             return self.engine.batch_transfer_sync_read(session_id, local_dsts, remote_srcs, nbytes)
 
+        merged_rdma_elapsed_ms = 0.0
+
+        def merged_rdma_read(local_dsts: list[int], remote_srcs: list[int], nbytes: list[int]) -> int:
+            nonlocal merged_rdma_elapsed_ms
+            started_at = time.perf_counter()
+            direct_count = len(plan.direct_runs)
+            packed_count = max(0, len(nbytes) - direct_count)
+            total_bytes = sum(nbytes)
+            logger.info(
+                "D merged RDMA batch start: transfer_id=%s direct_entries=%d packed_chunks=%d "
+                "total_descriptors=%d total_bytes=%d",
+                remote_request_id,
+                direct_count,
+                packed_count,
+                len(nbytes),
+                total_bytes,
+            )
+            ret = self.engine.batch_transfer_sync_read(session_id, local_dsts, remote_srcs, nbytes)
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            merged_rdma_elapsed_ms += elapsed_ms
+            logger.info(
+                "D merged RDMA batch done: transfer_id=%s session=%s direct_entries=%d "
+                "packed_chunks=%d total_descriptors=%d total_bytes=%d elapsed_ms=%.2f ret=%d",
+                remote_request_id,
+                session_id,
+                direct_count,
+                packed_count,
+                len(nbytes),
+                total_bytes,
+                elapsed_ms,
+                ret,
+            )
+            return ret
+
         def send_ack(msg: ReadAckMsg) -> None:
             rpc_started_at = time.perf_counter()
             socket_get_ms = encode_ms = zmq_send_ms = zmq_recv_wait_ms = decode_ms = socket_return_ms = 0.0
@@ -2002,26 +2036,28 @@ class KVCacheRecvingThread(threading.Thread):
             prepare_read_batch=prepare_read_batch,
             send_ack_batch=send_ack_batch,
             rdma_read_batch=rdma_read_batch,
+            merged_rdma_read=merged_rdma_read,
             batch_window_size=self.staging_coordinator.pool.num_slots,
         )
         staging_executor_ms = (time.perf_counter() - staging_started_at) * 1000
-        # The coordinator executes direct runs before packed chunks.  Report
-        # the packed staging portion separately so direct_ms + staging_ms is
-        # not double-counted in the end-to-end summary.
-        staging_elapsed_ms = max(0.0, staging_executor_ms - direct_elapsed_ms)
+        # Keep direct, merged RDMA, and staging orchestration time separate so
+        # the transfer summary does not double-count the merged data phase.
+        staging_elapsed_ms = max(0.0, staging_executor_ms - direct_elapsed_ms - merged_rdma_elapsed_ms)
         logger.info(
             "Staging transfer done: transfer_id=%s, success=%s",
             remote_request_id, result.success,
         )
         logger.info(
             "D transfer summary: transfer_id=%s metadata_ms=%.2f metadata_to_plan_ms=%.2f "
-            "plan_ms=%.2f direct_ms=%.2f staging_ms=%.2f staging_executor_ms=%.2f total_ms=%.2f "
+            "plan_ms=%.2f direct_ms=%.2f merged_rdma_ms=%.2f staging_ms=%.2f "
+            "staging_executor_ms=%.2f total_ms=%.2f "
             "direct_bytes=%d direct_entries=%d packed_bytes=%d packed_entries=%d packed_chunks=%d success=%s",
             remote_request_id,
             metadata_ms,
             address_plan_ms,
             plan_ms,
             direct_elapsed_ms,
+            merged_rdma_elapsed_ms,
             staging_elapsed_ms,
             staging_executor_ms,
             (time.perf_counter() - transfer_started_at) * 1000,

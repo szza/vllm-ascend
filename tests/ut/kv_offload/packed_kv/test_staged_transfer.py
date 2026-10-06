@@ -337,6 +337,75 @@ class TestStagedTransfer:
             d_rel = d_addr - f.d_base
             assert f.d_kv[d_rel : d_rel + length].tolist() == f.p_kv[s_rel : s_rel + length].tolist()
 
+    def test_mixed_direct_and_packed_uses_one_merged_rdma_submission(self) -> None:
+        """Direct and first-window staging descriptors share one RDMA batch."""
+        f = _Fixture(
+            num_blocks=64,
+            block_len=1024,
+            slot_capacity=16384,
+            min_direct_size=2048,
+            chunk_capacity=16384,
+        )
+        src_list = [
+            f.p_base + 0 * f.block_len,
+            f.p_base + 4 * f.block_len,
+            *[f.p_base + (10 + i) * f.block_len for i in range(10)],
+        ]
+        dst_list = [
+            f.d_base + 0 * f.block_len,
+            f.d_base + 4 * f.block_len,
+            *[f.d_base + (20 + i) * f.block_len for i in range(10)],
+        ]
+        length_list = [4 * f.block_len, 4 * f.block_len, *([f.block_len] * 10)]
+        spans = spans_from_flat_entries(src_list, dst_list, length_list, request_id="r-merged")
+        plan = TransferPlanner(min_direct_size=f.min_direct_size, chunk_capacity=f.chunk_capacity).plan(
+            spans, peer_session="p0"
+        )
+        assert len(plan.direct_runs) == 2
+        assert len(plan.packed_chunks) == 1
+
+        merged_calls: list[tuple[list[int], list[int], list[int]]] = []
+
+        def merged_rdma_read(d_addrs: list[int], p_addrs: list[int], lengths: list[int]) -> int:
+            merged_calls.append((d_addrs, p_addrs, lengths))
+            d_pool_start = f.d_pool.base_ptr
+            d_pool_end = d_pool_start + f.d_pool.num_slots * f.d_pool.slot_capacity
+            for d_addr, p_addr, nbytes in zip(d_addrs, p_addrs, lengths):
+                if d_pool_start <= d_addr < d_pool_end:
+                    assert f.rdma_read(d_addr, p_addr, nbytes) == 0
+                else:
+                    assert f.direct_transfer([p_addr], [d_addr], [nbytes]) == 0
+            return 0
+
+        def send_ack_batch(msg: ReadAckBatchMsg) -> None:
+            for item in msg.results:
+                f.p_service.handle_read_ack(
+                    ReadAckMsg(transfer_id=msg.transfer_id, chunk_id=item.chunk_id, success=item.success)
+                )
+
+        result = f.d_coordinator.execute(
+            plan,
+            transfer_id="tx-merged",
+            direct_transfer=f.direct_transfer,
+            prepare_read=f.prepare_read_fn,
+            rdma_read=f.rdma_read,
+            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.p_service.handle_prepare_read_batch,
+            send_ack_batch=send_ack_batch,
+            rdma_read_batch=merged_rdma_read,
+        )
+
+        assert result.success
+        assert result.direct_entries == len(plan.direct_runs)
+        assert result.packed_entries == sum(len(chunk.scatter_entries) for chunk in plan.packed_chunks)
+        assert len(merged_calls) == 1
+        assert len(merged_calls[0][2]) == len(plan.direct_runs) + len(plan.packed_chunks)
+        assert f.p_service.active_slot_count == 0
+        for s_addr, d_addr, length in zip(src_list, dst_list, length_list):
+            s_rel = s_addr - f.p_base
+            d_rel = d_addr - f.d_base
+            assert f.d_kv[d_rel : d_rel + length].tolist() == f.p_kv[s_rel : s_rel + length].tolist()
+
     def test_ack_releases_p_slots(self) -> None:
         """After transfer, all P slots are released via READ_ACK."""
         f = _Fixture()

@@ -5,8 +5,9 @@
 Orchestrates the full READY → READ → SCATTER → ACK cycle for a
 ``TransferPlan``:
 
-1. **Direct runs** are transferred via the TE as before (already large
-   enough to trigger HCCS+RoCE dual-link splitting).
+1. **Direct runs** are transferred via the TE. When packed chunks are also
+   present and a batch callback is available, their descriptors are submitted
+   with the first staging window.
 2. **Packed chunks** go through the staging protocol:
    acquire D slot → PREPARE_READ → PACK_READY → RDMA read (one large
    entry) → scatter from D slot → READ_ACK → release D slot.
@@ -62,6 +63,17 @@ RdmaReadFn = Callable[[int, int, int], int]
 
 RdmaReadBatchFn = Callable[[list[int], list[int], list[int]], int]
 """(local_dst_addrs, remote_src_addrs, lengths) → return code."""
+
+
+@dataclass(frozen=True)
+class _ReadDescriptor:
+    """One Mooncake READ descriptor in D-local/P-remote address order."""
+
+    local_dst: int
+    remote_src: int
+    nbytes: int
+    kind: str
+    chunk_id: int | None = None
 
 SendAckFn = Callable[[ReadAckMsg], None]
 """Send READ_ACK to P after scatter is done."""
@@ -120,6 +132,7 @@ class DecodeStagingCoordinator:
         prepare_read_batch: PrepareReadBatchFn | None = None,
         send_ack_batch: SendAckBatchFn | None = None,
         rdma_read_batch: RdmaReadBatchFn | None = None,
+        merged_rdma_read: RdmaReadBatchFn | None = None,
         batch_window_size: int | None = None,
     ) -> StagedTransferResult:
         """Execute a full TransferPlan.
@@ -140,20 +153,30 @@ class DecodeStagingCoordinator:
         send_ack : callable
             Sends READ_ACK to P after scatter.
         prepare_read_batch : callable, optional
-            Batched PREPARE_READ callback. Used only when more than one
-            packed chunk is present and ``send_ack_batch`` is also supplied.
+            Batched PREPARE_READ callback. Used for multi-chunk windows and
+            for a mixed DirectRun + single-chunk window when available.
         send_ack_batch : callable, optional
             Batched READ_ACK callback.
         rdma_read_batch : callable, optional
             Batched RDMA callback. If omitted, the batch protocol falls back
             to one RDMA call per chunk.
+        merged_rdma_read : callable, optional
+            Batched RDMA callback used when DirectRun and staging descriptors
+            are submitted together. If omitted, ``rdma_read_batch`` is used.
         batch_window_size : int, optional
             Maximum number of chunks in one batch. Defaults to the number of
             D-side staging slots.
         """
         result = StagedTransferResult(success=True)
 
-        if plan.direct_runs and direct_transfer is not None:
+        direct_descriptors = self._build_direct_descriptors(plan)
+        merged_read = merged_rdma_read or rdma_read_batch
+        direct_pending = bool(direct_descriptors and plan.packed_chunks and merged_read is not None)
+
+        # Preserve the legacy direct-first behavior when a merged callback is
+        # unavailable. The merged path defers DirectRun until PACK_READY
+        # supplies the staging source address.
+        if plan.direct_runs and direct_transfer is not None and not direct_pending:
             ret = self._execute_direct_runs(plan, direct_transfer)
             if ret != 0:
                 result.success = False
@@ -167,6 +190,8 @@ class DecodeStagingCoordinator:
             and prepare_read_batch is not None
             and send_ack_batch is not None
         )
+        if direct_pending and len(plan.packed_chunks) == 1:
+            use_batch = prepare_read_batch is not None and send_ack_batch is not None
         if use_batch:
             window_size = batch_window_size or self.pool.num_slots
             if window_size <= 0:
@@ -187,10 +212,11 @@ class DecodeStagingCoordinator:
                     transfer_id=transfer_id,
                     prepare_read_batch=prepare_read_batch,
                     rdma_read=rdma_read,
-                    rdma_read_batch=rdma_read_batch,
+                    rdma_read_batch=merged_read if direct_pending else rdma_read_batch,
                     send_ack_batch=send_ack_batch,
+                    direct_descriptors=direct_descriptors if direct_pending else (),
                 )
-                err, packed_bytes, packed_entries, chunks_completed = batch_result
+                err, packed_bytes, packed_entries, chunks_completed, direct_completed = batch_result
                 result.packed_bytes += packed_bytes
                 result.packed_entries += packed_entries
                 result.chunks_completed += chunks_completed
@@ -198,6 +224,10 @@ class DecodeStagingCoordinator:
                     result.success = False
                     result.error = err
                     return result
+                if direct_completed:
+                    result.direct_bytes = plan.total_direct_bytes
+                    result.direct_entries = len(plan.direct_runs)
+                    direct_pending = False
                 continue
 
             chunk = packed_batch[0]
@@ -207,6 +237,8 @@ class DecodeStagingCoordinator:
                 prepare_read=prepare_read,
                 rdma_read=rdma_read,
                 send_ack=send_ack,
+                rdma_read_batch=merged_read if direct_pending else None,
+                direct_descriptors=direct_descriptors if direct_pending else (),
             )
             if err is not None:
                 result.success = False
@@ -215,14 +247,31 @@ class DecodeStagingCoordinator:
             result.packed_bytes += chunk.payload_bytes
             result.packed_entries += len(chunk.scatter_entries)
             result.chunks_completed += 1
+            if direct_pending:
+                result.direct_bytes = plan.total_direct_bytes
+                result.direct_entries = len(plan.direct_runs)
+                direct_pending = False
 
         return result
 
     def _execute_direct_runs(self, plan: TransferPlan, direct_transfer: DirectTransferFn) -> int:
-        src_addrs = [dr.src_offset for dr in plan.direct_runs]
-        dst_addrs = [dr.dst_offset for dr in plan.direct_runs]
-        lengths = [dr.nbytes for dr in plan.direct_runs]
+        descriptors = self._build_direct_descriptors(plan)
+        src_addrs = [descriptor.remote_src for descriptor in descriptors]
+        dst_addrs = [descriptor.local_dst for descriptor in descriptors]
+        lengths = [descriptor.nbytes for descriptor in descriptors]
         return direct_transfer(src_addrs, dst_addrs, lengths)
+
+    @staticmethod
+    def _build_direct_descriptors(plan: TransferPlan) -> tuple[_ReadDescriptor, ...]:
+        return tuple(
+            _ReadDescriptor(
+                local_dst=run.dst_offset,
+                remote_src=run.src_offset,
+                nbytes=run.nbytes,
+                kind="direct",
+            )
+            for run in plan.direct_runs
+        )
 
     def _execute_chunk(
         self,
@@ -231,6 +280,8 @@ class DecodeStagingCoordinator:
         prepare_read: PrepareReadFn,
         rdma_read: RdmaReadFn,
         send_ack: SendAckFn,
+        rdma_read_batch: RdmaReadBatchFn | None = None,
+        direct_descriptors: tuple[_ReadDescriptor, ...] = (),
     ) -> str | None:
         """Execute one packed chunk. Returns error string or None."""
         if chunk.payload_bytes > self.pool.slot_capacity:
@@ -266,7 +317,33 @@ class DecodeStagingCoordinator:
                 )
 
             d_slot_addr = self.pool.slot_ptr(slot.slot_id)
-            ret = rdma_read(d_slot_addr, response.slot_addr, chunk.payload_bytes)
+            staging_descriptor = _ReadDescriptor(
+                local_dst=d_slot_addr,
+                remote_src=response.slot_addr,
+                nbytes=chunk.payload_bytes,
+                kind="staging",
+                chunk_id=chunk.chunk_id,
+            )
+            if direct_descriptors:
+                if rdma_read_batch is None:
+                    self._send_abort(send_ack, transfer_id, chunk.chunk_id)
+                    return f"merged RDMA callback unavailable for chunk {chunk.chunk_id}"
+                descriptors = (*direct_descriptors, staging_descriptor)
+                logger.info(
+                    "D merged RDMA batch start: transfer_id=%s direct_entries=%d packed_chunks=1 "
+                    "total_descriptors=%d total_bytes=%d",
+                    transfer_id,
+                    len(direct_descriptors),
+                    len(descriptors),
+                    sum(descriptor.nbytes for descriptor in descriptors),
+                )
+                ret = rdma_read_batch(
+                    [descriptor.local_dst for descriptor in descriptors],
+                    [descriptor.remote_src for descriptor in descriptors],
+                    [descriptor.nbytes for descriptor in descriptors],
+                )
+            else:
+                ret = rdma_read(d_slot_addr, response.slot_addr, chunk.payload_bytes)
             t_rdma = time.perf_counter()
 
             if ret != 0:
@@ -369,7 +446,8 @@ class DecodeStagingCoordinator:
         rdma_read: RdmaReadFn,
         rdma_read_batch: RdmaReadBatchFn | None,
         send_ack_batch: SendAckBatchFn,
-    ) -> tuple[str | None, int, int, int]:
+        direct_descriptors: tuple[_ReadDescriptor, ...] = (),
+    ) -> tuple[str | None, int, int, int, bool]:
         """Execute one batch window with one RDMA submission and scatter."""
         t0 = time.perf_counter()
         slots = []
@@ -381,13 +459,14 @@ class DecodeStagingCoordinator:
                     0,
                     0,
                     0,
+                    False,
                 )
         for chunk in chunks:
             slot = self.pool.acquire()
             if slot is None:
                 for acquired in slots:
                     self.pool.release(acquired.slot_id)
-                return f"no D staging slot for batch window", 0, 0, 0
+                return f"no D staging slot for batch window", 0, 0, 0, False
             slots.append(slot)
         t_acquire = time.perf_counter()
 
@@ -403,6 +482,7 @@ class DecodeStagingCoordinator:
         t_ack = t_rdma
         ack_ms = 0.0
         scatter_total_ms = 0.0
+        direct_completed = False
         try:
             logger.info(
                 "D staging batch prepare start: transfer_id=%s chunks=%d bytes=%d",
@@ -484,20 +564,41 @@ class DecodeStagingCoordinator:
                     ready_chunks.append((chunk, slot, ready))
 
                 if first_error is None and ready_chunks:
-                    d_addrs = [self.pool.slot_ptr(slot.slot_id) for _, slot, _ in ready_chunks]
-                    p_addrs = [ready.slot_addr for _, _, ready in ready_chunks]
-                    lengths = [chunk.payload_bytes for chunk, _, _ in ready_chunks]
+                    staging_descriptors = [
+                        _ReadDescriptor(
+                            local_dst=self.pool.slot_ptr(slot.slot_id),
+                            remote_src=ready.slot_addr,
+                            nbytes=chunk.payload_bytes,
+                            kind="staging",
+                            chunk_id=chunk.chunk_id,
+                        )
+                        for chunk, slot, ready in ready_chunks
+                    ]
+                    descriptors = (*direct_descriptors, *staging_descriptors)
+                    d_addrs = [descriptor.local_dst for descriptor in descriptors]
+                    p_addrs = [descriptor.remote_src for descriptor in descriptors]
+                    lengths = [descriptor.nbytes for descriptor in descriptors]
                     logger.info(
-                        "D staging batch RDMA start: transfer_id=%s chunks=%d bytes=%d",
+                        "D staging batch RDMA start: transfer_id=%s direct_entries=%d chunks=%d "
+                        "total_descriptors=%d bytes=%d",
                         transfer_id,
-                        len(lengths),
+                        len(direct_descriptors),
+                        len(staging_descriptors),
+                        len(descriptors),
                         sum(lengths),
                     )
-                    if rdma_read_batch is not None:
+                    if direct_descriptors and rdma_read_batch is None:
+                        ret = -1
+                        first_error = "merged RDMA callback unavailable"
+                    elif rdma_read_batch is not None:
                         ret = rdma_read_batch(d_addrs, p_addrs, lengths)
                     else:
                         ret = 0
-                        for d_addr, p_addr, nbytes in zip(d_addrs, p_addrs, lengths):
+                        for d_addr, p_addr, nbytes in zip(
+                            [descriptor.local_dst for descriptor in staging_descriptors],
+                            [descriptor.remote_src for descriptor in staging_descriptors],
+                            [descriptor.nbytes for descriptor in staging_descriptors],
+                        ):
                             ret = rdma_read(d_addr, p_addr, nbytes)
                             if ret != 0:
                                 break
@@ -506,7 +607,14 @@ class DecodeStagingCoordinator:
                         first_error = f"RDMA batch read failed: ret={ret}"
                         logger.error("D staging batch RDMA failed: transfer_id=%s ret=%d", transfer_id, ret)
                     else:
-                        logger.info("D staging batch RDMA done: transfer_id=%s chunks=%d", transfer_id, len(lengths))
+                        direct_completed = bool(direct_descriptors)
+                        logger.info(
+                            "D staging batch RDMA done: transfer_id=%s staging_chunks=%d "
+                            "total_descriptors=%d",
+                            transfer_id,
+                            len(staging_descriptors),
+                            len(lengths),
+                        )
                         scatter_timing: dict[str, float] = {}
                         scatter_start = time.perf_counter()
                         try:
@@ -624,7 +732,7 @@ class DecodeStagingCoordinator:
                 (t_ack - t0) * 1000,
                 first_error is None,
             )
-            return first_error, packed_bytes, packed_entries, chunks_completed
+            return first_error, packed_bytes, packed_entries, chunks_completed, direct_completed
         finally:
             for slot in slots:
                 self.pool.release(slot.slot_id)
