@@ -167,6 +167,11 @@ class TestSlotView:
         view.fill_(42)
         assert view[0].item() == 42
 
+    def test_slot_view_is_cached(self) -> None:
+        pool = StagingPool(num_slots=2, slot_capacity=256, alignment=64, device="cpu")
+        assert pool.slot_view(0) is pool.slot_view(0)
+        assert pool.slot_view(1) is pool.slot_view(1)
+
     def test_slot_views_independent(self) -> None:
         pool = StagingPool(num_slots=2, slot_capacity=256, alignment=64, device="cpu")
         v0 = pool.slot_view(0)

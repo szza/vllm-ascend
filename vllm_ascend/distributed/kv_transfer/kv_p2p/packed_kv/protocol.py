@@ -35,6 +35,9 @@ class StagingMsgType(enum.IntEnum):
     PREPARE_WRITE = 6
     WRITE_READY = 7
     WRITE_DONE = 8
+    PREPARE_READ_BATCH = 9
+    PACK_READY_BATCH = 10
+    READ_ACK_BATCH = 11
 
 
 class PrepareReadMsg(msgspec.Struct, array_like=True):
@@ -66,6 +69,54 @@ class ReadAckMsg(msgspec.Struct, array_like=True):
     transfer_id: str
     chunk_id: int
     success: bool = True
+
+
+class PrepareReadBatchItem(msgspec.Struct, array_like=True):
+    """One chunk in a batched READ prepare request."""
+
+    chunk_id: int
+    gather_entries: list[tuple[int, int, int]]
+    total_bytes: int
+
+
+class PrepareReadBatchMsg(msgspec.Struct, array_like=True):
+    """D -> P: request gathers for multiple chunks."""
+
+    transfer_id: str
+    chunks: list[PrepareReadBatchItem]
+
+
+class PackReadyBatchItem(msgspec.Struct, array_like=True):
+    """Result for one chunk in a batched READ prepare response."""
+
+    chunk_id: int
+    success: bool
+    slot_addr: int = 0
+    payload_bytes: int = 0
+    gather_ms: float = 0.0
+    error_code: int = 0
+    error: str = ""
+
+
+class PackReadyBatchMsg(msgspec.Struct, array_like=True):
+    """P -> D: gather results for multiple chunks."""
+
+    transfer_id: str
+    results: list[PackReadyBatchItem]
+
+
+class ReadAckBatchItem(msgspec.Struct, array_like=True):
+    """Completion status for one chunk in a batched READ ack."""
+
+    chunk_id: int
+    success: bool = True
+
+
+class ReadAckBatchMsg(msgspec.Struct, array_like=True):
+    """D -> P: release multiple READ staging slots."""
+
+    transfer_id: str
+    results: list[ReadAckBatchItem]
 
 
 class StagingCapabilityMsg(msgspec.Struct, array_like=True):
@@ -120,6 +171,9 @@ _MSG_TYPE_MAP: dict[StagingMsgType, type[msgspec.Struct]] = {
     StagingMsgType.PREPARE_READ: PrepareReadMsg,
     StagingMsgType.PACK_READY: PackReadyMsg,
     StagingMsgType.READ_ACK: ReadAckMsg,
+    StagingMsgType.PREPARE_READ_BATCH: PrepareReadBatchMsg,
+    StagingMsgType.PACK_READY_BATCH: PackReadyBatchMsg,
+    StagingMsgType.READ_ACK_BATCH: ReadAckBatchMsg,
     StagingMsgType.CAPABILITY: StagingCapabilityMsg,
     StagingMsgType.ERROR: StagingErrorMsg,
     StagingMsgType.PREPARE_WRITE: PrepareWriteMsg,
@@ -168,6 +222,12 @@ __all__ = [
     "PrepareReadMsg",
     "PackReadyMsg",
     "ReadAckMsg",
+    "PrepareReadBatchItem",
+    "PrepareReadBatchMsg",
+    "PackReadyBatchItem",
+    "PackReadyBatchMsg",
+    "ReadAckBatchItem",
+    "ReadAckBatchMsg",
     "PrepareWriteMsg",
     "WriteReadyMsg",
     "WriteDoneMsg",

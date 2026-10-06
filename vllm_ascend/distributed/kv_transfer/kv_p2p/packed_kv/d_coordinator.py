@@ -18,17 +18,18 @@ be tested in-process without ZMQ or a real TransferEngine.
 
 from __future__ import annotations
 
-import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Union
+from typing import Any, Union
 
 import torch
+from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.copy import (
     unpack_from_staging,
     unpack_from_staging_multi,
+    unpack_from_staging_multi_batch,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
     PackedChunk,
@@ -36,13 +37,16 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+    PackReadyBatchMsg,
     PackReadyMsg,
+    PrepareReadBatchItem,
+    PrepareReadBatchMsg,
     PrepareReadMsg,
+    ReadAckBatchItem,
+    ReadAckBatchMsg,
     ReadAckMsg,
     StagingErrorMsg,
 )
-
-logger = logging.getLogger(__name__)
 
 DirectTransferFn = Callable[[list[int], list[int], list[int]], int]
 """(src_addrs, dst_addrs, lengths) → return code (0 = success)."""
@@ -50,11 +54,20 @@ DirectTransferFn = Callable[[list[int], list[int], list[int]], int]
 PrepareReadFn = Callable[[PrepareReadMsg], Union[PackReadyMsg, StagingErrorMsg]]  # noqa: UP007
 """Send PREPARE_READ to P, get PACK_READY or error back."""
 
+PrepareReadBatchFn = Callable[[PrepareReadBatchMsg], PackReadyBatchMsg]
+"""Send a batch PREPARE_READ to P and get all gather results back."""
+
 RdmaReadFn = Callable[[int, int, int], int]
 """(local_dst_addr, remote_src_addr, nbytes) → return code."""
 
+RdmaReadBatchFn = Callable[[list[int], list[int], list[int]], int]
+"""(local_dst_addrs, remote_src_addrs, lengths) → return code."""
+
 SendAckFn = Callable[[ReadAckMsg], None]
 """Send READ_ACK to P after scatter is done."""
+
+SendAckBatchFn = Callable[[ReadAckBatchMsg], None]
+"""Send completion status for a batch of chunks to P."""
 
 
 @dataclass
@@ -104,6 +117,10 @@ class DecodeStagingCoordinator:
         prepare_read: PrepareReadFn,
         rdma_read: RdmaReadFn,
         send_ack: SendAckFn,
+        prepare_read_batch: PrepareReadBatchFn | None = None,
+        send_ack_batch: SendAckBatchFn | None = None,
+        rdma_read_batch: RdmaReadBatchFn | None = None,
+        batch_window_size: int | None = None,
     ) -> StagedTransferResult:
         """Execute a full TransferPlan.
 
@@ -122,6 +139,17 @@ class DecodeStagingCoordinator:
             RDMA read from P slot to D slot (single large entry).
         send_ack : callable
             Sends READ_ACK to P after scatter.
+        prepare_read_batch : callable, optional
+            Batched PREPARE_READ callback. Used only when more than one
+            packed chunk is present and ``send_ack_batch`` is also supplied.
+        send_ack_batch : callable, optional
+            Batched READ_ACK callback.
+        rdma_read_batch : callable, optional
+            Batched RDMA callback. If omitted, the batch protocol falls back
+            to one RDMA call per chunk.
+        batch_window_size : int, optional
+            Maximum number of chunks in one batch. Defaults to the number of
+            D-side staging slots.
         """
         result = StagedTransferResult(success=True)
 
@@ -134,7 +162,45 @@ class DecodeStagingCoordinator:
             result.direct_bytes = plan.total_direct_bytes
             result.direct_entries = len(plan.direct_runs)
 
-        for chunk in plan.packed_chunks:
+        use_batch = (
+            len(plan.packed_chunks) > 1
+            and prepare_read_batch is not None
+            and send_ack_batch is not None
+        )
+        if use_batch:
+            window_size = batch_window_size or self.pool.num_slots
+            if window_size <= 0:
+                result.success = False
+                result.error = f"invalid batch window size: {window_size}"
+                return result
+            packed_batches = (
+                plan.packed_chunks[start : start + window_size]
+                for start in range(0, len(plan.packed_chunks), window_size)
+            )
+        else:
+            packed_batches = ((chunk,) for chunk in plan.packed_chunks)
+
+        for packed_batch in packed_batches:
+            if use_batch:
+                batch_result = self._execute_batch(
+                    packed_batch,
+                    transfer_id=transfer_id,
+                    prepare_read_batch=prepare_read_batch,
+                    rdma_read=rdma_read,
+                    rdma_read_batch=rdma_read_batch,
+                    send_ack_batch=send_ack_batch,
+                )
+                err, packed_bytes, packed_entries, chunks_completed = batch_result
+                result.packed_bytes += packed_bytes
+                result.packed_entries += packed_entries
+                result.chunks_completed += chunks_completed
+                if err is not None:
+                    result.success = False
+                    result.error = err
+                    return result
+                continue
+
+            chunk = packed_batch[0]
             err = self._execute_chunk(
                 chunk,
                 transfer_id=transfer_id,
@@ -209,11 +275,13 @@ class DecodeStagingCoordinator:
 
             try:
                 staging_view = self.pool.slot_view(slot.slot_id)
+                scatter_timing: dict[str, float] = {}
                 if self.dst_regions:
                     unpack_from_staging_multi(
                         staging_view,
                         self.dst_regions,
                         chunk.scatter_entries,
+                        timing=scatter_timing,
                     )
                 else:
                     unpack_from_staging(
@@ -221,11 +289,39 @@ class DecodeStagingCoordinator:
                         self.dst_tensor,
                         self.dst_base_addr,
                         chunk.scatter_entries,
+                        timing=scatter_timing,
                     )
             except Exception:
                 self._send_abort(send_ack, transfer_id, chunk.chunk_id)
                 raise
             t_scatter = time.perf_counter()
+
+            logger.info(
+                "D scatter breakdown: transfer=%s chunk=%d bytes=%d total_ms=%.2f "
+                "descriptor_ms=%.2f descriptor_list_ms=%.2f descriptor_tensor_ms=%.2f "
+                "descriptor_prepare_ms=%.2f descriptor_alloc_ms=%.2f "
+                "descriptor_fill_ms=%.2f "
+                "swap_blocks_batch_ms=%.2f synchronize_ms=%.2f copy_stream_wait_ms=%.2f "
+                "slice_scatter_ms=%.2f unpack_total_ms=%.2f",
+                transfer_id,
+                chunk.chunk_id,
+                chunk.payload_bytes,
+                (t_scatter - t_rdma) * 1000,
+                scatter_timing.get("descriptor_ms", 0.0),
+                scatter_timing.get("descriptor_list_ms", 0.0),
+                scatter_timing.get("descriptor_tensor_ms", 0.0),
+                scatter_timing.get("descriptor_prepare_ms", 0.0),
+                scatter_timing.get("descriptor_alloc_ms", 0.0),
+                scatter_timing.get("descriptor_fill_ms", 0.0),
+                scatter_timing.get("swap_blocks_batch_ms", 0.0),
+                scatter_timing.get("synchronize_ms", 0.0),
+                scatter_timing.get("copy_stream_wait_ms", 0.0),
+                scatter_timing.get("slice_scatter_ms", 0.0),
+                scatter_timing.get(
+                    "unpack_from_staging_multi_ms",
+                    scatter_timing.get("unpack_from_staging_ms", 0.0),
+                ),
+            )
 
             send_ack(ReadAckMsg(transfer_id=transfer_id, chunk_id=chunk.chunk_id, success=True))
             t_ack = time.perf_counter()
@@ -246,10 +342,292 @@ class DecodeStagingCoordinator:
                 (t_ack - t_scatter) * 1000,
                 (t_ack - t0) * 1000,
             )
+            logger.info(
+                "D staging window timing: transfer_id=%s chunks=1 entries=%d bytes=%d "
+                "acquire_ms=%.2f prepare_ms=%.2f rdma_ms=%.2f scatter_ms=%.2f "
+                "ack_ms=%.2f total_ms=%.2f success=true",
+                transfer_id,
+                len(chunk.scatter_entries),
+                chunk.payload_bytes,
+                (t_acquire - t0) * 1000,
+                (t_prepare - t_acquire) * 1000,
+                (t_rdma - t_prepare) * 1000,
+                (t_scatter - t_rdma) * 1000,
+                (t_ack - t_scatter) * 1000,
+                (t_ack - t0) * 1000,
+            )
         finally:
             self.pool.release(slot.slot_id)
 
         return None
+
+    def _execute_batch(
+        self,
+        chunks: tuple[PackedChunk, ...],
+        transfer_id: str,
+        prepare_read_batch: PrepareReadBatchFn,
+        rdma_read: RdmaReadFn,
+        rdma_read_batch: RdmaReadBatchFn | None,
+        send_ack_batch: SendAckBatchFn,
+    ) -> tuple[str | None, int, int, int]:
+        """Execute one batch window with one RDMA submission and scatter."""
+        t0 = time.perf_counter()
+        slots = []
+        for chunk in chunks:
+            if chunk.payload_bytes > self.pool.slot_capacity:
+                return (
+                    f"chunk {chunk.chunk_id} exceeds D staging slot capacity: "
+                    f"payload={chunk.payload_bytes}, capacity={self.pool.slot_capacity}",
+                    0,
+                    0,
+                    0,
+                )
+        for chunk in chunks:
+            slot = self.pool.acquire()
+            if slot is None:
+                for acquired in slots:
+                    self.pool.release(acquired.slot_id)
+                return f"no D staging slot for batch window", 0, 0, 0
+            slots.append(slot)
+        t_acquire = time.perf_counter()
+
+        ack_items: list[ReadAckBatchItem] = []
+        packed_bytes = 0
+        packed_entries = 0
+        chunks_completed = 0
+        first_error: str | None = None
+        ready_by_chunk = {}
+        scatter_timings: dict[int, tuple[float, float]] = {}
+        t_prepare = t_acquire
+        t_rdma = t_prepare
+        t_ack = t_rdma
+        ack_ms = 0.0
+        scatter_total_ms = 0.0
+        try:
+            logger.info(
+                "D staging batch prepare start: transfer_id=%s chunks=%d bytes=%d",
+                transfer_id,
+                len(chunks),
+                sum(chunk.payload_bytes for chunk in chunks),
+            )
+            response = prepare_read_batch(
+                PrepareReadBatchMsg(
+                    transfer_id=transfer_id,
+                    chunks=[
+                        PrepareReadBatchItem(
+                            chunk_id=chunk.chunk_id,
+                            gather_entries=[
+                                (g.src_offset, g.packed_offset, g.nbytes) for g in chunk.gather_entries
+                            ],
+                            total_bytes=chunk.payload_bytes,
+                        )
+                        for chunk in chunks
+                    ],
+                )
+            )
+            t_prepare = time.perf_counter()
+            if response.transfer_id != transfer_id:
+                first_error = (
+                    f"P returned wrong transfer id for batch: "
+                    f"expected={transfer_id}, got={response.transfer_id}"
+                )
+                logger.error(
+                    "D staging batch prepare transfer mismatch: transfer_id=%s response_transfer_id=%s",
+                    transfer_id,
+                    response.transfer_id,
+                )
+            else:
+                ready_by_chunk = {item.chunk_id: item for item in response.results}
+                logger.info(
+                    "D staging batch ready received: transfer_id=%s results=%d success=%d failed=%d",
+                    transfer_id,
+                    len(response.results),
+                    sum(item.success for item in response.results),
+                    sum(not item.success for item in response.results),
+                )
+                ready_chunks: list[tuple[PackedChunk, Any, Any]] = []
+                for chunk, slot in zip(chunks, slots):
+                    ready = ready_by_chunk.get(chunk.chunk_id)
+                    if ready is None:
+                        first_error = f"P returned no result for chunk {chunk.chunk_id}"
+                        logger.error(
+                            "D staging batch missing ready: transfer_id=%s chunk_id=%d",
+                            transfer_id,
+                            chunk.chunk_id,
+                        )
+                        break
+                    if not ready.success:
+                        first_error = f"P rejected PREPARE_READ for chunk {chunk.chunk_id}: {ready.error}"
+                        logger.error(
+                            "D staging batch chunk rejected: transfer_id=%s chunk_id=%d code=%d reason=%s",
+                            transfer_id,
+                            chunk.chunk_id,
+                            ready.error_code,
+                            ready.error,
+                        )
+                        break
+                    if ready.payload_bytes != chunk.payload_bytes:
+                        first_error = (
+                            f"P returned wrong payload size for chunk {chunk.chunk_id}: "
+                            f"expected={chunk.payload_bytes}, got={ready.payload_bytes}"
+                        )
+                        logger.error(
+                            "D staging batch payload mismatch: transfer_id=%s chunk_id=%d expected=%d got=%d",
+                            transfer_id,
+                            chunk.chunk_id,
+                            chunk.payload_bytes,
+                            ready.payload_bytes,
+                        )
+                        ack_items.append(ReadAckBatchItem(chunk_id=chunk.chunk_id, success=False))
+                        break
+
+                    ready_chunks.append((chunk, slot, ready))
+
+                if first_error is None and ready_chunks:
+                    d_addrs = [self.pool.slot_ptr(slot.slot_id) for _, slot, _ in ready_chunks]
+                    p_addrs = [ready.slot_addr for _, _, ready in ready_chunks]
+                    lengths = [chunk.payload_bytes for chunk, _, _ in ready_chunks]
+                    logger.info(
+                        "D staging batch RDMA start: transfer_id=%s chunks=%d bytes=%d",
+                        transfer_id,
+                        len(lengths),
+                        sum(lengths),
+                    )
+                    if rdma_read_batch is not None:
+                        ret = rdma_read_batch(d_addrs, p_addrs, lengths)
+                    else:
+                        ret = 0
+                        for d_addr, p_addr, nbytes in zip(d_addrs, p_addrs, lengths):
+                            ret = rdma_read(d_addr, p_addr, nbytes)
+                            if ret != 0:
+                                break
+                    t_rdma = time.perf_counter()
+                    if ret != 0:
+                        first_error = f"RDMA batch read failed: ret={ret}"
+                        logger.error("D staging batch RDMA failed: transfer_id=%s ret=%d", transfer_id, ret)
+                    else:
+                        logger.info("D staging batch RDMA done: transfer_id=%s chunks=%d", transfer_id, len(lengths))
+                        scatter_timing: dict[str, float] = {}
+                        scatter_start = time.perf_counter()
+                        try:
+                            staging_views = [self.pool.slot_view(slot.slot_id) for _, slot, _ in ready_chunks]
+                            scatter_entry_batches = [chunk.scatter_entries for chunk, _, _ in ready_chunks]
+                            dst_regions = self.dst_regions or [(self.dst_base_addr, self.dst_tensor)]
+                            unpack_from_staging_multi_batch(
+                                staging_views,
+                                dst_regions,
+                                scatter_entry_batches,
+                                timing=scatter_timing,
+                            )
+                        except Exception as exc:
+                            first_error = f"batch scatter failed: {exc}"
+                            logger.exception("D staging batch scatter failed: transfer_id=%s", transfer_id)
+                        scatter_end = time.perf_counter()
+                        scatter_total_ms = (scatter_end - scatter_start) * 1000
+                        logger.info(
+                            "D scatter breakdown: transfer=%s chunks=%d entries=%d bytes=%d total_ms=%.2f "
+                            "descriptor_ms=%.2f descriptor_list_ms=%.2f descriptor_tensor_ms=%.2f "
+                            "descriptor_prepare_ms=%.2f descriptor_alloc_ms=%.2f "
+                            "descriptor_fill_ms=%.2f "
+                            "swap_blocks_batch_ms=%.2f synchronize_ms=%.2f copy_stream_wait_ms=%.2f "
+                            "slice_scatter_ms=%.2f unpack_total_ms=%.2f",
+                            transfer_id,
+                            len(ready_chunks),
+                            sum(len(chunk.scatter_entries) for chunk, _, _ in ready_chunks),
+                            sum(chunk.payload_bytes for chunk, _, _ in ready_chunks),
+                            scatter_total_ms,
+                            scatter_timing.get("descriptor_ms", 0.0),
+                            scatter_timing.get("descriptor_list_ms", 0.0),
+                            scatter_timing.get("descriptor_tensor_ms", 0.0),
+                            scatter_timing.get("descriptor_prepare_ms", 0.0),
+                            scatter_timing.get("descriptor_alloc_ms", 0.0),
+                            scatter_timing.get("descriptor_fill_ms", 0.0),
+                            scatter_timing.get("swap_blocks_batch_ms", 0.0),
+                            scatter_timing.get("synchronize_ms", 0.0),
+                            scatter_timing.get("copy_stream_wait_ms", 0.0),
+                            scatter_timing.get("slice_scatter_ms", 0.0),
+                            scatter_timing.get(
+                                "unpack_from_staging_multi_batch_ms",
+                                scatter_timing.get("unpack_from_staging_multi_ms", 0.0),
+                            ),
+                        )
+                        for chunk, _, _ in ready_chunks:
+                            scatter_timings[chunk.chunk_id] = (scatter_start, scatter_end)
+                            if first_error is not None:
+                                break
+                            ack_items.append(ReadAckBatchItem(chunk_id=chunk.chunk_id, success=True))
+                            packed_bytes += chunk.payload_bytes
+                            packed_entries += len(chunk.scatter_entries)
+                            chunks_completed += 1
+
+                if first_error is not None:
+                    acked_ids = {item.chunk_id for item in ack_items}
+                    for chunk in chunks:
+                        if chunk.chunk_id in ready_by_chunk and chunk.chunk_id not in acked_ids:
+                            ack_items.append(ReadAckBatchItem(chunk_id=chunk.chunk_id, success=False))
+
+            # Release every P-side slot that returned PackReady, including
+            # chunks after the first error that were gathered successfully.
+            ready_ids = set(ready_by_chunk)
+            acked_ids = {item.chunk_id for item in ack_items}
+            for chunk in chunks:
+                if chunk.chunk_id in ready_ids and chunk.chunk_id not in acked_ids:
+                    ack_items.append(ReadAckBatchItem(chunk_id=chunk.chunk_id, success=False))
+            if ack_items:
+                logger.info(
+                    "D staging batch ACK send: transfer_id=%s chunks=%d success=%d failed=%d",
+                    transfer_id,
+                    len(ack_items),
+                    sum(item.success for item in ack_items),
+                    sum(not item.success for item in ack_items),
+                )
+                t_ack_start = time.perf_counter()
+                send_ack_batch(ReadAckBatchMsg(transfer_id=transfer_id, results=ack_items))
+                t_ack = time.perf_counter()
+                ack_ms = (t_ack - t_ack_start) * 1000
+
+                ack_by_chunk = {item.chunk_id: item for item in ack_items}
+                for chunk in chunks:
+                    ready = ready_by_chunk.get(chunk.chunk_id)
+                    ack_item = ack_by_chunk.get(chunk.chunk_id)
+                    p_gather_ms = getattr(ready, "gather_ms", 0.0) if ready is not None else 0.0
+                    scatter_start, scatter_end = scatter_timings.get(chunk.chunk_id, (t_rdma, t_rdma))
+                    scatter_ms = (scatter_end - scatter_start) * 1000 if ack_item and ack_item.success else 0.0
+                    logger.info(
+                        "D chunk timing: transfer=%s chunk=%d bytes=%d | "
+                        "acquire=%.2fms prepare=%.2fms(p_gather=%.2fms) "
+                        "rdma=%.2fms scatter=%.2fms ack=%.2fms total=%.2fms",
+                        transfer_id,
+                        chunk.chunk_id,
+                        chunk.payload_bytes,
+                        (t_acquire - t0) * 1000,
+                        (t_prepare - t_acquire) * 1000,
+                        p_gather_ms,
+                        (t_rdma - t_prepare) * 1000,
+                        scatter_ms,
+                        ack_ms,
+                        (t_ack - t0) * 1000,
+                    )
+            logger.info(
+                "D staging window timing: transfer_id=%s chunks=%d entries=%d bytes=%d "
+                "acquire_ms=%.2f prepare_ms=%.2f rdma_ms=%.2f scatter_ms=%.2f "
+                "ack_ms=%.2f total_ms=%.2f success=%s",
+                transfer_id,
+                len(chunks),
+                sum(len(chunk.scatter_entries) for chunk in chunks),
+                sum(chunk.payload_bytes for chunk in chunks),
+                (t_acquire - t0) * 1000,
+                (t_prepare - t_acquire) * 1000,
+                (t_rdma - t_prepare) * 1000,
+                scatter_total_ms,
+                ack_ms,
+                (t_ack - t0) * 1000,
+                first_error is None,
+            )
+            return first_error, packed_bytes, packed_entries, chunks_completed
+        finally:
+            for slot in slots:
+                self.pool.release(slot.slot_id)
 
     @staticmethod
     def _send_abort(send_ack: SendAckFn, transfer_id: str, chunk_id: int) -> None:

@@ -3,9 +3,15 @@
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+    PackReadyBatchItem,
+    PackReadyBatchMsg,
     PackReadyMsg,
+    PrepareReadBatchItem,
+    PrepareReadBatchMsg,
     PrepareReadMsg,
     PrepareWriteMsg,
+    ReadAckBatchItem,
+    ReadAckBatchMsg,
     ReadAckMsg,
     StagingCapabilityMsg,
     StagingErrorMsg,
@@ -23,6 +29,59 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
 
 
 class TestEncodeDecodeRoundtrip:
+    def test_prepare_read_batch_roundtrip(self) -> None:
+        msg = PrepareReadBatchMsg(
+            transfer_id="tx-batch",
+            chunks=[
+                PrepareReadBatchItem(
+                    chunk_id=0,
+                    gather_entries=[(100, 0, 64)],
+                    total_bytes=64,
+                ),
+                PrepareReadBatchItem(
+                    chunk_id=1,
+                    gather_entries=[(200, 0, 128)],
+                    total_bytes=128,
+                ),
+            ],
+        )
+        decoded = decode_msg(encode_msg(msg))
+        assert isinstance(decoded, PrepareReadBatchMsg)
+        assert decoded.transfer_id == "tx-batch"
+        assert [item.chunk_id for item in decoded.chunks] == [0, 1]
+
+    def test_pack_ready_batch_roundtrip(self) -> None:
+        msg = PackReadyBatchMsg(
+            transfer_id="tx-batch-ready",
+            results=[
+                PackReadyBatchItem(
+                    chunk_id=0,
+                    success=True,
+                    slot_addr=0x1000,
+                    payload_bytes=64,
+                ),
+                PackReadyBatchItem(
+                    chunk_id=1,
+                    success=False,
+                    error_code=1,
+                    error="no slot",
+                ),
+            ],
+        )
+        decoded = decode_msg(encode_msg(msg))
+        assert isinstance(decoded, PackReadyBatchMsg)
+        assert decoded.results[0].slot_addr == 0x1000
+        assert decoded.results[1].error == "no slot"
+
+    def test_read_ack_batch_roundtrip(self) -> None:
+        msg = ReadAckBatchMsg(
+            transfer_id="tx-ack-batch",
+            results=[ReadAckBatchItem(chunk_id=0), ReadAckBatchItem(chunk_id=1, success=False)],
+        )
+        decoded = decode_msg(encode_msg(msg))
+        assert isinstance(decoded, ReadAckBatchMsg)
+        assert [item.success for item in decoded.results] == [True, False]
+
     def test_prepare_read_roundtrip(self) -> None:
         msg = PrepareReadMsg(
             transfer_id="tx-001",

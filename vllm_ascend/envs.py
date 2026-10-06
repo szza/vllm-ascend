@@ -122,6 +122,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_STAGING_SLOT_CAPACITY_MIB": lambda: int(
         os.getenv("VLLM_ASCEND_STAGING_SLOT_CAPACITY_MIB", "16")
     ),
+    # Entry size threshold in bytes for bypassing staging and using direct RDMA.
+    # Entries smaller than this value are packed into staging slots.
+    "VLLM_ASCEND_STAGING_MIN_DIRECT_SIZE": lambda: int(
+        os.getenv("VLLM_ASCEND_STAGING_MIN_DIRECT_SIZE", str(1 * 1024 * 1024))
+    ),
 }
 
 # end-env-vars-definition

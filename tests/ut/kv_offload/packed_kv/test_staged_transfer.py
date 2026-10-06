@@ -31,8 +31,12 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+    PackReadyBatchMsg,
     PackReadyMsg,
+    PrepareReadBatchItem,
+    PrepareReadBatchMsg,
     PrepareReadMsg,
+    ReadAckBatchMsg,
     ReadAckMsg,
     StagingErrorMsg,
 )
@@ -197,6 +201,57 @@ class TestStagedTransfer:
         assert result.success
         assert result.chunks_completed == len(plan.packed_chunks)
 
+        for s_addr, d_addr, length in zip(src_list, dst_list, length_list):
+            s_rel = s_addr - f.p_base
+            d_rel = d_addr - f.d_base
+            assert f.d_kv[d_rel : d_rel + length].tolist() == f.p_kv[s_rel : s_rel + length].tolist()
+
+    def test_multi_chunk_batch_uses_one_rdma_submission_per_window(self) -> None:
+        """Batch prepare and batch RDMA preserve data and window boundaries."""
+        f = _Fixture(num_slots=2, slot_capacity=2048, chunk_capacity=2048)
+        rng = random.Random(78)
+        n = 8
+        src_ids = rng.sample(range(f.num_blocks), n)
+        dst_ids = rng.sample(range(f.num_blocks), n)
+
+        src_list = [f.p_base + s * f.block_len for s in src_ids]
+        dst_list = [f.d_base + d * f.block_len for d in dst_ids]
+        length_list = [f.block_len] * n
+        spans = spans_from_flat_entries(src_list, dst_list, length_list, request_id="r-batch")
+        planner = TransferPlanner(min_direct_size=f.min_direct_size, chunk_capacity=f.chunk_capacity)
+        plan = planner.plan(spans, peer_session="p0")
+        assert len(plan.packed_chunks) > 1
+
+        rdma_batch_calls: list[int] = []
+
+        def rdma_read_batch(d_addrs: list[int], p_addrs: list[int], lengths: list[int]) -> int:
+            rdma_batch_calls.append(len(lengths))
+            for d_addr, p_addr, nbytes in zip(d_addrs, p_addrs, lengths):
+                assert f.rdma_read(d_addr, p_addr, nbytes) == 0
+            return 0
+
+        def send_ack_batch(msg: ReadAckBatchMsg) -> None:
+            for item in msg.results:
+                assert f.p_service.handle_read_ack(
+                    ReadAckMsg(transfer_id=msg.transfer_id, chunk_id=item.chunk_id, success=item.success)
+                )
+
+        result = f.d_coordinator.execute(
+            plan,
+            transfer_id="tx-batch",
+            direct_transfer=f.direct_transfer,
+            prepare_read=f.prepare_read_fn,
+            rdma_read=f.rdma_read,
+            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.p_service.handle_prepare_read_batch,
+            send_ack_batch=send_ack_batch,
+            rdma_read_batch=rdma_read_batch,
+        )
+
+        assert result.success
+        assert result.chunks_completed == len(plan.packed_chunks)
+        assert rdma_batch_calls == [2] * ((len(plan.packed_chunks) + 1) // 2)
+        assert f.p_service.active_slot_count == 0
         for s_addr, d_addr, length in zip(src_list, dst_list, length_list):
             s_rel = s_addr - f.p_base
             d_rel = d_addr - f.d_base
@@ -494,6 +549,36 @@ class TestFailureHandling:
 
 
 class TestPrefillService:
+    def test_prepare_read_batch_returns_per_chunk_results(self) -> None:
+        f = _Fixture(num_slots=2)
+        msg = PrepareReadBatchMsg(
+            transfer_id="tx-batch-service",
+            chunks=[
+                PrepareReadBatchItem(
+                    chunk_id=0,
+                    gather_entries=[(f.p_base, 0, f.block_len)],
+                    total_bytes=f.block_len,
+                ),
+                PrepareReadBatchItem(
+                    chunk_id=1,
+                    gather_entries=[(f.p_base + f.block_len, 0, f.block_len)],
+                    total_bytes=f.block_len,
+                ),
+            ],
+        )
+
+        response = f.p_service.handle_prepare_read_batch(msg)
+
+        assert isinstance(response, PackReadyBatchMsg)
+        assert [item.chunk_id for item in response.results] == [0, 1]
+        assert all(item.success for item in response.results)
+        assert f.p_service.active_slot_count == 2
+        for item in response.results:
+            assert f.p_service.handle_read_ack(
+                ReadAckMsg(transfer_id=msg.transfer_id, chunk_id=item.chunk_id)
+            )
+        assert f.p_service.active_slot_count == 0
+
     def test_idempotent_prepare_read(self) -> None:
         """Duplicate PREPARE_READ returns same slot (no double alloc)."""
         f = _Fixture()

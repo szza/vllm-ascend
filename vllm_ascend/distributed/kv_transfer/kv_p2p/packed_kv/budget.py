@@ -12,6 +12,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import POOL_ALIGN
 DEFAULT_NUM_SLOTS = 2
 DEFAULT_SLOT_CAPACITY_MIB = 16
 MIB = 1024 * 1024
+DEFAULT_MIN_DIRECT_SIZE = 1 * MIB
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,7 @@ class StagingConfig:
     enabled: bool = False
     num_slots: int = DEFAULT_NUM_SLOTS
     slot_capacity: int = DEFAULT_SLOT_CAPACITY_MIB * MIB
+    min_direct_size: int = DEFAULT_MIN_DIRECT_SIZE
     alignment: int = POOL_ALIGNMENT
 
 
@@ -27,10 +29,12 @@ def staging_config_from_env() -> StagingConfig:
     enabled = os.getenv("VLLM_ASCEND_STAGING_ENABLED", "0") == "1"
     num_slots = int(os.getenv("VLLM_ASCEND_STAGING_NUM_SLOTS", str(DEFAULT_NUM_SLOTS)))
     slot_mib = int(os.getenv("VLLM_ASCEND_STAGING_SLOT_CAPACITY_MIB", str(DEFAULT_SLOT_CAPACITY_MIB)))
+    min_direct_size = int(os.getenv("VLLM_ASCEND_STAGING_MIN_DIRECT_SIZE", str(DEFAULT_MIN_DIRECT_SIZE)))
     return StagingConfig(
         enabled=enabled,
         num_slots=num_slots,
         slot_capacity=slot_mib * MIB,
+        min_direct_size=min_direct_size,
     )
 
 

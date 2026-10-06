@@ -14,6 +14,7 @@ Provides two paths:
 from __future__ import annotations
 
 import bisect
+import time
 from collections.abc import Sequence
 
 import torch
@@ -28,23 +29,71 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPoo
 DIRECTION_D2D = 2
 
 _has_batch_dma: bool | None = None
+_batch_copy_streams = {}
 
 
-def _synchronize_batch_copy() -> None:
-    """Wait for the async NPU DMA issued by ``swap_blocks_batch``.
+def _get_batch_copy_stream():
+    """Return the stream used by packed-KV batch copies for this NPU device."""
+    npu = getattr(torch, "npu", None)
+    if npu is None:
+        return None
+
+    device_idx = int(npu.current_device())
+    stream = _batch_copy_streams.get(device_idx)
+    if stream is None:
+        stream = npu.Stream()
+        _batch_copy_streams[device_idx] = stream
+    return stream
+
+
+def _run_batch_copy(
+    src_ptrs: torch.Tensor,
+    dst_ptrs: torch.Tensor,
+    sizes: torch.Tensor,
+    timing: dict[str, float] | None = None,
+    *,
+    wait_current_stream: bool = False,
+) -> None:
+    """Submit and wait for one batch copy without synchronizing the default stream.
 
     The Ascend operator is asynchronous with respect to the Python caller.
     Staging protocol messages must only be sent after the copy is visible to
-    the peer, so synchronize the current stream before returning from a batch
-    gather or scatter.
-
-    TODO: replace the full-stream synchronization with a per-copy NPU event.
-    The event can be recorded after ``swap_blocks_batch`` and waited on by the
-    control path, preserving overlap with unrelated work on the same device.
+    the peer, so wait for a completion event before returning from a batch
+    gather or scatter.  The event is recorded on a dedicated stream, which
+    avoids waiting for unrelated work queued on the current/default stream.
     """
     npu = getattr(torch, "npu", None)
-    if npu is not None:
-        npu.current_stream().synchronize()
+    if npu is None:
+        torch.ops._C_ascend.swap_blocks_batch(src_ptrs, dst_ptrs, sizes, DIRECTION_D2D)
+        return
+
+    copy_stream = _get_batch_copy_stream()
+    if copy_stream is None:
+        torch.ops._C_ascend.swap_blocks_batch(src_ptrs, dst_ptrs, sizes, DIRECTION_D2D)
+        return
+
+    t_swap = time.perf_counter()
+    current_stream = npu.current_stream() if wait_current_stream else None
+    with torch.npu.stream(copy_stream):
+        if current_stream is not None:
+            # Gather reads KV data produced by the model stream.  Preserve
+            # that dependency without synchronizing the host on the stream.
+            copy_stream.wait_stream(current_stream)
+        torch.ops._C_ascend.swap_blocks_batch(src_ptrs, dst_ptrs, sizes, DIRECTION_D2D)
+        copy_done = torch.npu.Event()
+        copy_done.record(copy_stream)
+    if timing is not None:
+        timing["swap_blocks_batch_ms"] = (time.perf_counter() - t_swap) * 1000
+
+    t_wait = time.perf_counter()
+    copy_done.synchronize()
+    wait_ms = (time.perf_counter() - t_wait) * 1000
+    if timing is not None:
+        # Keep the old key so existing log parsers continue to work.  It now
+        # measures only this batch's event, rather than a full current-stream
+        # synchronization.
+        timing["synchronize_ms"] = wait_ms
+        timing["copy_stream_wait_ms"] = wait_ms
 
 
 def _check_batch_dma() -> bool:
@@ -58,36 +107,83 @@ def _check_batch_dma() -> bool:
     return _has_batch_dma
 
 
+def _build_cpu_descriptor_tensors(
+    src_addrs: Sequence[int],
+    dst_addrs: Sequence[int],
+    sizes: Sequence[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build host descriptor arrays in bulk for ``swap_blocks_batch``."""
+    if not (len(src_addrs) == len(dst_addrs) == len(sizes)):
+        raise ValueError(
+            "descriptor arrays must have equal lengths: "
+            f"src={len(src_addrs)}, dst={len(dst_addrs)}, sizes={len(sizes)}"
+        )
+    return (
+        torch.tensor(src_addrs, dtype=torch.int64, device="cpu"),
+        torch.tensor(dst_addrs, dtype=torch.int64, device="cpu"),
+        torch.tensor(sizes, dtype=torch.int64, device="cpu"),
+    )
+
+
 def _batch_gather(
     staging_base_addr: int,
     gather_entries: Sequence[GatherEntry],
+    timing: dict[str, float] | None = None,
 ) -> None:
-    n = len(gather_entries)
-    src_ptrs = torch.empty(n, dtype=torch.int64)
-    dst_ptrs = torch.empty(n, dtype=torch.int64)
-    sizes = torch.empty(n, dtype=torch.int64)
-    for i, g in enumerate(gather_entries):
-        src_ptrs[i] = g.src_offset
-        dst_ptrs[i] = staging_base_addr + g.packed_offset
-        sizes[i] = g.nbytes
-    torch.ops._C_ascend.swap_blocks_batch(src_ptrs, dst_ptrs, sizes, DIRECTION_D2D)
-    _synchronize_batch_copy()
+    t_descriptor = time.perf_counter()
+    src_addrs = [g.src_offset for g in gather_entries]
+    dst_addrs = [staging_base_addr + g.packed_offset for g in gather_entries]
+    sizes = [g.nbytes for g in gather_entries]
+    t_descriptor_prepare = time.perf_counter()
+    src_ptrs, dst_ptrs, sizes = _build_cpu_descriptor_tensors(src_addrs, dst_addrs, sizes)
+    t_descriptor_alloc = time.perf_counter()
+    if timing is not None:
+        timing["descriptor_list_ms"] = (t_descriptor_prepare - t_descriptor) * 1000
+        timing["descriptor_tensor_ms"] = (t_descriptor_alloc - t_descriptor_prepare) * 1000
+        timing["descriptor_prepare_ms"] = (t_descriptor_prepare - t_descriptor) * 1000
+        timing["descriptor_alloc_ms"] = (t_descriptor_alloc - t_descriptor_prepare) * 1000
+        # Keep the legacy key, but define it as tensor construction only.
+        timing["descriptor_fill_ms"] = (t_descriptor_alloc - t_descriptor_prepare) * 1000
+        timing["descriptor_ms"] = (time.perf_counter() - t_descriptor) * 1000
+
+    _run_batch_copy(src_ptrs, dst_ptrs, sizes, timing, wait_current_stream=True)
 
 
 def _batch_scatter(
     staging_base_addr: int,
     scatter_entries: Sequence[ScatterEntry],
+    timing: dict[str, float] | None = None,
 ) -> None:
-    n = len(scatter_entries)
-    src_ptrs = torch.empty(n, dtype=torch.int64)
-    dst_ptrs = torch.empty(n, dtype=torch.int64)
-    sizes = torch.empty(n, dtype=torch.int64)
-    for i, s in enumerate(scatter_entries):
-        src_ptrs[i] = staging_base_addr + s.packed_offset
-        dst_ptrs[i] = s.dst_offset
-        sizes[i] = s.nbytes
-    torch.ops._C_ascend.swap_blocks_batch(src_ptrs, dst_ptrs, sizes, DIRECTION_D2D)
-    _synchronize_batch_copy()
+    _batch_scatter_multi(((staging_base_addr, scatter_entries),), timing)
+
+
+def _batch_scatter_multi(
+    scatter_batches: Sequence[tuple[int, Sequence[ScatterEntry]]],
+    timing: dict[str, float] | None = None,
+) -> None:
+    """Submit scatter entries from multiple staging slots in one DMA batch."""
+    t_descriptor = time.perf_counter()
+    src_addrs: list[int] = []
+    dst_addrs: list[int] = []
+    size_values: list[int] = []
+    for staging_base_addr, scatter_entries in scatter_batches:
+        for s in scatter_entries:
+            src_addrs.append(staging_base_addr + s.packed_offset)
+            dst_addrs.append(s.dst_offset)
+            size_values.append(s.nbytes)
+    t_descriptor_prepare = time.perf_counter()
+    src_ptrs, dst_ptrs, sizes = _build_cpu_descriptor_tensors(src_addrs, dst_addrs, size_values)
+    t_descriptor_alloc = time.perf_counter()
+
+    if timing is not None:
+        timing["descriptor_list_ms"] = (t_descriptor_prepare - t_descriptor) * 1000
+        timing["descriptor_tensor_ms"] = (t_descriptor_alloc - t_descriptor_prepare) * 1000
+        timing["descriptor_prepare_ms"] = (t_descriptor_prepare - t_descriptor) * 1000
+        timing["descriptor_alloc_ms"] = (t_descriptor_alloc - t_descriptor_prepare) * 1000
+        timing["descriptor_fill_ms"] = (t_descriptor_alloc - t_descriptor_prepare) * 1000
+        timing["descriptor_ms"] = (time.perf_counter() - t_descriptor) * 1000
+
+    _run_batch_copy(src_ptrs, dst_ptrs, sizes, timing)
 
 
 def _slice_gather(
@@ -191,14 +287,21 @@ def pack_into_staging(
     src_base_addr: int,
     staging: torch.Tensor,
     gather_entries: Sequence[GatherEntry],
+    timing: dict[str, float] | None = None,
 ) -> None:
     """Gather from KV cache regions into a contiguous staging buffer."""
     if not gather_entries:
         return
+    t_total = time.perf_counter()
     if _check_batch_dma() and getattr(src, "is_npu", False):
-        _batch_gather(staging.data_ptr(), gather_entries)
+        _batch_gather(staging.data_ptr(), gather_entries, timing)
     else:
+        t_slice = time.perf_counter()
         _slice_gather(src, src_base_addr, staging, gather_entries)
+        if timing is not None:
+            timing["slice_gather_ms"] = (time.perf_counter() - t_slice) * 1000
+    if timing is not None:
+        timing["pack_into_staging_ms"] = (time.perf_counter() - t_total) * 1000
 
 
 def unpack_from_staging(
@@ -206,20 +309,28 @@ def unpack_from_staging(
     dst: torch.Tensor,
     dst_base_addr: int,
     scatter_entries: Sequence[ScatterEntry],
+    timing: dict[str, float] | None = None,
 ) -> None:
     """Scatter from staging buffer to KV cache regions."""
     if not scatter_entries:
         return
+    t_total = time.perf_counter()
     if _check_batch_dma() and getattr(dst, "is_npu", False):
-        _batch_scatter(staging.data_ptr(), scatter_entries)
+        _batch_scatter(staging.data_ptr(), scatter_entries, timing)
     else:
+        t_slice = time.perf_counter()
         _slice_scatter(staging, dst, dst_base_addr, scatter_entries)
+        if timing is not None:
+            timing["slice_scatter_ms"] = (time.perf_counter() - t_slice) * 1000
+    if timing is not None:
+        timing["unpack_from_staging_ms"] = (time.perf_counter() - t_total) * 1000
 
 
 def pack_into_staging_multi(
     regions: Sequence[tuple[int, torch.Tensor]],
     staging: torch.Tensor,
     gather_entries: Sequence[GatherEntry],
+    timing: dict[str, float] | None = None,
 ) -> None:
     """Gather from multiple KV cache tensors into a contiguous staging buffer.
 
@@ -229,16 +340,23 @@ def pack_into_staging_multi(
     """
     if not gather_entries:
         return
+    t_total = time.perf_counter()
     if _check_batch_dma() and getattr(staging, "is_npu", False):
-        _batch_gather(staging.data_ptr(), gather_entries)
+        _batch_gather(staging.data_ptr(), gather_entries, timing)
     else:
+        t_slice = time.perf_counter()
         _slice_gather_multi(regions, staging, gather_entries)
+        if timing is not None:
+            timing["slice_gather_ms"] = (time.perf_counter() - t_slice) * 1000
+    if timing is not None:
+        timing["pack_into_staging_multi_ms"] = (time.perf_counter() - t_total) * 1000
 
 
 def unpack_from_staging_multi(
     staging: torch.Tensor,
     regions: Sequence[tuple[int, torch.Tensor]],
     scatter_entries: Sequence[ScatterEntry],
+    timing: dict[str, float] | None = None,
 ) -> None:
     """Scatter from staging buffer to multiple KV cache tensors.
 
@@ -248,10 +366,53 @@ def unpack_from_staging_multi(
     """
     if not scatter_entries:
         return
+    t_total = time.perf_counter()
     if _check_batch_dma() and getattr(staging, "is_npu", False):
-        _batch_scatter(staging.data_ptr(), scatter_entries)
+        _batch_scatter(staging.data_ptr(), scatter_entries, timing)
     else:
+        t_slice = time.perf_counter()
         _slice_scatter_multi(staging, regions, scatter_entries)
+        if timing is not None:
+            timing["slice_scatter_ms"] = (time.perf_counter() - t_slice) * 1000
+    if timing is not None:
+        timing["unpack_from_staging_multi_ms"] = (time.perf_counter() - t_total) * 1000
+
+
+def unpack_from_staging_multi_batch(
+    staging_views: Sequence[torch.Tensor],
+    regions: Sequence[tuple[int, torch.Tensor]],
+    scatter_entry_batches: Sequence[Sequence[ScatterEntry]],
+    timing: dict[str, float] | None = None,
+) -> None:
+    """Scatter multiple staging slots into KV regions with one DMA batch."""
+    if len(staging_views) != len(scatter_entry_batches):
+        raise ValueError(
+            "staging_views and scatter_entry_batches must have the same length: "
+            f"views={len(staging_views)}, batches={len(scatter_entry_batches)}"
+        )
+    if not staging_views or not any(scatter_entry_batches):
+        return
+
+    t_total = time.perf_counter()
+    use_dma = _check_batch_dma() and all(getattr(view, "is_npu", False) for view in staging_views)
+    if use_dma:
+        _batch_scatter_multi(
+            tuple(
+                (staging.data_ptr(), scatter_entries)
+                for staging, scatter_entries in zip(staging_views, scatter_entry_batches)
+                if scatter_entries
+            ),
+            timing,
+        )
+    else:
+        t_slice = time.perf_counter()
+        for staging, scatter_entries in zip(staging_views, scatter_entry_batches):
+            if scatter_entries:
+                _slice_scatter_multi(staging, regions, scatter_entries)
+        if timing is not None:
+            timing["slice_scatter_ms"] = (time.perf_counter() - t_slice) * 1000
+    if timing is not None:
+        timing["unpack_from_staging_multi_batch_ms"] = (time.perf_counter() - t_total) * 1000
 
 
 def execute_plan_on_tensors(
@@ -272,14 +433,11 @@ def execute_plan_on_tensors(
 
     if plan.direct_runs:
         if use_dma:
-            n = len(plan.direct_runs)
-            src_ptrs = torch.empty(n, dtype=torch.int64)
-            dst_ptrs = torch.empty(n, dtype=torch.int64)
-            sizes = torch.empty(n, dtype=torch.int64)
-            for i, dr in enumerate(plan.direct_runs):
-                src_ptrs[i] = dr.src_offset
-                dst_ptrs[i] = dr.dst_offset
-                sizes[i] = dr.nbytes
+            src_ptrs, dst_ptrs, sizes = _build_cpu_descriptor_tensors(
+                [dr.src_offset for dr in plan.direct_runs],
+                [dr.dst_offset for dr in plan.direct_runs],
+                [dr.nbytes for dr in plan.direct_runs],
+            )
             torch.ops._C_ascend.swap_blocks_batch(src_ptrs, dst_ptrs, sizes, DIRECTION_D2D)
         else:
             src_flat = src.view(-1)
@@ -319,14 +477,11 @@ def execute_plan_on_tensors_multi(
 
     if plan.direct_runs:
         if use_dma:
-            n = len(plan.direct_runs)
-            src_ptrs = torch.empty(n, dtype=torch.int64)
-            dst_ptrs = torch.empty(n, dtype=torch.int64)
-            sizes = torch.empty(n, dtype=torch.int64)
-            for i, dr in enumerate(plan.direct_runs):
-                src_ptrs[i] = dr.src_offset
-                dst_ptrs[i] = dr.dst_offset
-                sizes[i] = dr.nbytes
+            src_ptrs, dst_ptrs, sizes = _build_cpu_descriptor_tensors(
+                [dr.src_offset for dr in plan.direct_runs],
+                [dr.dst_offset for dr in plan.direct_runs],
+                [dr.nbytes for dr in plan.direct_runs],
+            )
             torch.ops._C_ascend.swap_blocks_batch(src_ptrs, dst_ptrs, sizes, DIRECTION_D2D)
         else:
             src_bases = [r[0] for r in src_regions]
@@ -359,4 +514,5 @@ __all__ = [
     "pack_into_staging_multi",
     "unpack_from_staging",
     "unpack_from_staging_multi",
+    "unpack_from_staging_multi_batch",
 ]

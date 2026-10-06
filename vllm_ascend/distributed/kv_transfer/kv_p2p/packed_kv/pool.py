@@ -73,6 +73,12 @@ class StagingPool:
             )
             for i in range(num_slots)
         ]
+        # Slot views are immutable byte ranges within the pool.  Cache them
+        # once so the hot gather/scatter path does not recreate an NPU view
+        # with ``narrow`` for every chunk.
+        self._slot_views = [
+            self._pool_view.narrow(0, slot.offset, slot.capacity) for slot in self._slots
+        ]
         self._registered = False
         self._engine: Any = None
         # Connector transfers can call acquire/release from multiple worker
@@ -122,8 +128,7 @@ class StagingPool:
             slot.generation += 1
 
     def slot_view(self, slot_id: int) -> torch.Tensor:
-        slot = self._slots[slot_id]
-        return self._pool_view.narrow(0, slot.offset, slot.capacity)
+        return self._slot_views[slot_id]
 
     def slot_ptr(self, slot_id: int) -> int:
         slot = self._slots[slot_id]

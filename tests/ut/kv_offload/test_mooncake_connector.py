@@ -78,6 +78,15 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
     zmq_ctx,
 )
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (  # noqa: E402
+    PackReadyBatchMsg,
+    PackReadyMsg,
+    PrepareReadBatchItem,
+    PrepareReadBatchMsg,
+    decode_msg,
+    encode_msg,
+)
+
 for _k, _v in _saved_modules.items():
     sys.modules[_k] = _v
 
@@ -269,6 +278,68 @@ class TestKVCacheSendingThread(unittest.TestCase):
 
         sock.close()
         context.term()
+
+    def test_staging_executor_reassembles_batch_by_chunk_order(self):
+        class FakePool:
+            num_slots = 2
+
+            @staticmethod
+            def slot_view(_slot_id):
+                return types.SimpleNamespace(device=torch.device("cpu"))
+
+        class FakeStagingService:
+            pool = FakePool()
+
+            @staticmethod
+            def handle_prepare_read(msg):
+                # Complete chunk 1 first to verify aggregation does not use
+                # completion order as the batch order.
+                time.sleep(0.02 if msg.chunk_id == 0 else 0.001)
+                return PackReadyMsg(
+                    transfer_id=msg.transfer_id,
+                    chunk_id=msg.chunk_id,
+                    slot_addr=0x1000 + msg.chunk_id,
+                    payload_bytes=msg.total_bytes,
+                    gather_ms=1.0,
+                )
+
+        thread = KVCacheSendingThread(
+            tp_rank=0,
+            prefill_tp_size=1,
+            local_engine_id="engine1",
+            side_channel_host="127.0.0.1",
+            side_channel_port=5000,
+            metadata=make_agent_metadata(),
+            vllm_config=MockVllmConfig(),
+            ready_event=threading.Event(),
+            kv_caches={},
+            pcp_rank=0,
+            staging_service=FakeStagingService(),
+        )
+        try:
+            batch = PrepareReadBatchMsg(
+                transfer_id="tx-executor",
+                chunks=[
+                    PrepareReadBatchItem(chunk_id=0, gather_entries=[], total_bytes=64),
+                    PrepareReadBatchItem(chunk_id=1, gather_entries=[], total_bytes=128),
+                ],
+            )
+            self.assertTrue(thread._submit_staging_gather(MagicMock(), b"peer", encode_msg(batch)))
+            pending = thread._staging_futures[0]
+            for future in pending.futures:
+                future.result(timeout=1)
+
+            sock = MagicMock()
+            thread._drain_staging_futures(sock)
+            frames = sock.send_multipart.call_args.args[0]
+            self.assertEqual(frames[0], b"peer")
+            response = decode_msg(frames[2])
+            self.assertIsInstance(response, PackReadyBatchMsg)
+            self.assertEqual([item.chunk_id for item in response.results], [0, 1])
+            self.assertEqual([item.payload_bytes for item in response.results], [64, 128])
+        finally:
+            assert thread._staging_executor is not None
+            thread._staging_executor.shutdown(wait=True, cancel_futures=True)
 
     def test_reformat_kv_cache_hybrid_linear_uses_cache_block_size(self):
         block_size = 4

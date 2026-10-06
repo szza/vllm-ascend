@@ -227,6 +227,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         callback_func: Callable[..., None] = lambda x: None,
         staging_coordinator: Any = None,
         staging_enabled: bool = False,
+        staging_min_direct_size: int | None = None,
         get_remote_socket_fn: Callable | None = None,
         return_remote_socket_fn: Callable | None = None,
         remote_poller: Any = None,
@@ -271,6 +272,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.callback_func = callback_func
         self.staging_coordinator = staging_coordinator
         self.staging_enabled = staging_enabled
+        self.staging_min_direct_size = staging_min_direct_size
         self._get_remote_socket = get_remote_socket_fn
         self._return_remote_socket = return_remote_socket_fn
         self._remote_poller = remote_poller
@@ -573,12 +575,16 @@ class KVCacheSendingLayerThread(threading.Thread):
         remote_host = first_req_meta.remote_host
         remote_port = first_req_meta.remote_port
 
+        if self.staging_min_direct_size is None:
+            raise RuntimeError("staging_min_direct_size is required for staging transfers")
         plan = plan_from_flat_entries(
             src_list=transfer_meta.src,
             dst_list=transfer_meta.dst,
             length_list=transfer_meta.length,
             request_id=first_req_id,
             peer_session=session_id,
+            min_direct_size=self.staging_min_direct_size,
+            chunk_capacity=self.staging_coordinator.pool.slot_capacity,
         )
 
         logger.info(
@@ -1524,7 +1530,10 @@ class MooncakeLayerwiseConnectorWorker:
             layer_metadata=self.layer_metadata,
         )
 
-        staging_coordinator, write_service = self._create_staging_components(kv_caches)
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.budget import staging_config_from_env
+
+        staging_config = staging_config_from_env()
+        staging_coordinator, write_service = self._create_staging_components(kv_caches, staging_config)
 
         if self.vllm_config.kv_transfer_config.is_kv_producer:
             ready_event = threading.Event()
@@ -1551,6 +1560,7 @@ class MooncakeLayerwiseConnectorWorker:
                 callback_func=self.send_done_send_signal,
                 staging_coordinator=staging_coordinator,
                 staging_enabled=staging_coordinator is not None,
+                staging_min_direct_size=staging_config.min_direct_size,
                 get_remote_socket_fn=self._get_remote_socket,
                 return_remote_socket_fn=self._return_remote_socket,
                 remote_poller=self.remote_poller,
@@ -1574,17 +1584,12 @@ class MooncakeLayerwiseConnectorWorker:
             self.kv_recv_layer_thread.start()
             ready_event.wait()
 
-    def _create_staging_components(self, kv_caches: dict[str, torch.Tensor]):
+    def _create_staging_components(self, kv_caches: dict[str, torch.Tensor], config):
         """Create staging pool + coordinator/service if staging is enabled.
 
         Returns (coordinator, write_service) — exactly one is non-None
         depending on role, or both None if staging is disabled.
         """
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.budget import (
-            staging_config_from_env,
-        )
-
-        config = staging_config_from_env()
         if not config.enabled:
             return None, None
 

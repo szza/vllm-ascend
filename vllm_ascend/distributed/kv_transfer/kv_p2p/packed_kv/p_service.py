@@ -13,12 +13,12 @@ The service is transport-agnostic — callers invoke methods directly
 
 from __future__ import annotations
 
-import logging
 import threading
 import time
 from dataclasses import dataclass, field
 
 import torch
+from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.copy import (
     pack_into_staging,
@@ -30,13 +30,13 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
     PackReadyMsg,
+    PackReadyBatchItem,
+    PackReadyBatchMsg,
+    PrepareReadBatchMsg,
     PrepareReadMsg,
-    ReadAckMsg,
     StagingErrorMsg,
+    ReadAckMsg,
 )
-
-logger = logging.getLogger(__name__)
-
 
 @dataclass
 class _ActiveSlot:
@@ -113,9 +113,12 @@ class PrefillStagingService:
         Returns ``PackReadyMsg`` on success, ``StagingErrorMsg`` if no
         slot is available.
         """
+        handler_started_at = time.perf_counter()
         key = (msg.transfer_id, msg.chunk_id)
 
+        validation_started_at = time.perf_counter()
         error = self._validate_prepare_read(msg)
+        validation_finished_at = time.perf_counter()
         if error is not None:
             return StagingErrorMsg(
                 transfer_id=msg.transfer_id,
@@ -124,6 +127,7 @@ class PrefillStagingService:
                 reason=error,
             )
 
+        slot_started_at = time.perf_counter()
         with self._active_slots_lock:
             existing = self._active_slots.get(key)
             if existing is not None:
@@ -143,9 +147,12 @@ class PrefillStagingService:
                     chunk_id=msg.chunk_id,
                 )
                 self._active_slots[key] = existing
+        slot_finished_at = time.perf_counter()
 
         if slot is None:
+            wait_started_at = time.perf_counter()
             existing.ready.wait()
+            wait_finished_at = time.perf_counter()
             if existing.error is not None:
                 return StagingErrorMsg(
                     transfer_id=msg.transfer_id,
@@ -153,6 +160,17 @@ class PrefillStagingService:
                     code=4,
                     reason=existing.error,
                 )
+            logger.info(
+                "P handle_prepare timing: transfer=%s chunk=%d outcome=duplicate "
+                "validate_ms=%.2f slot_ms=%.2f duplicate_wait_ms=%.2f "
+                "handler_total_ms=%.2f",
+                msg.transfer_id,
+                msg.chunk_id,
+                (validation_finished_at - validation_started_at) * 1000,
+                (slot_finished_at - slot_started_at) * 1000,
+                (wait_finished_at - wait_started_at) * 1000,
+                (time.perf_counter() - handler_started_at) * 1000,
+            )
             return PackReadyMsg(
                 transfer_id=msg.transfer_id,
                 chunk_id=msg.chunk_id,
@@ -160,17 +178,28 @@ class PrefillStagingService:
                 payload_bytes=msg.total_bytes,
             )
 
+        entry_started_at = time.perf_counter()
         gather_entries = [
             GatherEntry(src_offset=src, packed_offset=off, nbytes=n) for src, off, n in msg.gather_entries
         ]
+        entry_finished_at = time.perf_counter()
 
+        slot_view_started_at = time.perf_counter()
         staging_view = self.pool.slot_view(slot.slot_id)
+        slot_view_finished_at = time.perf_counter()
         t_gather = time.perf_counter()
+        gather_timing: dict[str, float] = {}
         try:
             if self.kv_regions:
-                pack_into_staging_multi(self.kv_regions, staging_view, gather_entries)
+                pack_into_staging_multi(self.kv_regions, staging_view, gather_entries, timing=gather_timing)
             else:
-                pack_into_staging(self.kv_tensor, self.kv_base_addr, staging_view, gather_entries)
+                pack_into_staging(
+                    self.kv_tensor,
+                    self.kv_base_addr,
+                    staging_view,
+                    gather_entries,
+                    timing=gather_timing,
+                )
         except Exception:
             with self._active_slots_lock:
                 active = self._active_slots.pop(key, None)
@@ -181,10 +210,54 @@ class PrefillStagingService:
             raise
 
         gather_ms = (time.perf_counter() - t_gather) * 1000
+        pack_finished_at = time.perf_counter()
+
+        logger.info(
+            "P gather breakdown: transfer=%s chunk=%d entries=%d bytes=%d total_ms=%.2f "
+            "descriptor_ms=%.2f descriptor_list_ms=%.2f descriptor_tensor_ms=%.2f "
+            "descriptor_prepare_ms=%.2f descriptor_alloc_ms=%.2f "
+            "descriptor_fill_ms=%.2f "
+            "swap_blocks_batch_ms=%.2f synchronize_ms=%.2f copy_stream_wait_ms=%.2f "
+            "slice_gather_ms=%.2f pack_total_ms=%.2f",
+            msg.transfer_id,
+            msg.chunk_id,
+            len(gather_entries),
+            msg.total_bytes,
+            gather_ms,
+            gather_timing.get("descriptor_ms", 0.0),
+            gather_timing.get("descriptor_list_ms", 0.0),
+            gather_timing.get("descriptor_tensor_ms", 0.0),
+            gather_timing.get("descriptor_prepare_ms", 0.0),
+            gather_timing.get("descriptor_alloc_ms", 0.0),
+            gather_timing.get("descriptor_fill_ms", 0.0),
+            gather_timing.get("swap_blocks_batch_ms", 0.0),
+            gather_timing.get("synchronize_ms", 0.0),
+            gather_timing.get("copy_stream_wait_ms", 0.0),
+            gather_timing.get("slice_gather_ms", 0.0),
+            gather_timing.get(
+                "pack_into_staging_multi_ms",
+                gather_timing.get("pack_into_staging_ms", 0.0),
+            ),
+        )
 
         existing.ready.set()
 
         slot_addr = self.pool.slot_ptr(slot.slot_id)
+        response_preparation_finished_at = time.perf_counter()
+        logger.info(
+            "P handle_prepare timing: transfer=%s chunk=%d outcome=ready "
+            "validate_ms=%.2f slot_ms=%.2f entry_build_ms=%.2f slot_view_ms=%.2f "
+            "pack_ms=%.2f post_pack_ms=%.2f handler_total_ms=%.2f",
+            msg.transfer_id,
+            msg.chunk_id,
+            (validation_finished_at - validation_started_at) * 1000,
+            (slot_finished_at - slot_started_at) * 1000,
+            (entry_finished_at - entry_started_at) * 1000,
+            (slot_view_finished_at - slot_view_started_at) * 1000,
+            (pack_finished_at - t_gather) * 1000,
+            (response_preparation_finished_at - pack_finished_at) * 1000,
+            (response_preparation_finished_at - handler_started_at) * 1000,
+        )
         logger.debug(
             "P gather done: transfer=%s chunk=%d slot=%d addr=0x%x bytes=%d gather_ms=%.2f",
             msg.transfer_id,
@@ -226,6 +299,44 @@ class PrefillStagingService:
             msg.success,
         )
         return True
+
+    def handle_prepare_read_batch(self, msg: PrepareReadBatchMsg) -> PackReadyBatchMsg:
+        """Gather a batch synchronously for direct callers and fallbacks.
+
+        The ZMQ listener fans batch items out to its gather executor.  This
+        method remains the transport-independent implementation used by local
+        callers and tests.
+        """
+        results: list[PackReadyBatchItem] = []
+        for item in msg.chunks:
+            response = self.handle_prepare_read(
+                PrepareReadMsg(
+                    transfer_id=msg.transfer_id,
+                    chunk_id=item.chunk_id,
+                    gather_entries=item.gather_entries,
+                    total_bytes=item.total_bytes,
+                )
+            )
+            if isinstance(response, StagingErrorMsg):
+                results.append(
+                    PackReadyBatchItem(
+                        chunk_id=item.chunk_id,
+                        success=False,
+                        error_code=response.code,
+                        error=response.reason,
+                    )
+                )
+            else:
+                results.append(
+                    PackReadyBatchItem(
+                        chunk_id=item.chunk_id,
+                        success=True,
+                        slot_addr=response.slot_addr,
+                        payload_bytes=response.payload_bytes,
+                        gather_ms=response.gather_ms,
+                    )
+                )
+        return PackReadyBatchMsg(transfer_id=msg.transfer_id, results=results)
 
     @property
     def active_slot_count(self) -> int:

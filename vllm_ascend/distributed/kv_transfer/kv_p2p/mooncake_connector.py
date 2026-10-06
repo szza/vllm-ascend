@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import contextlib
+import concurrent.futures
 import copy
 import hashlib
 import logging
@@ -243,6 +244,27 @@ class KVCacheTaskTracker:
         return expired_requests
 
 
+@dataclass
+class _PendingStagingGather:
+    """Gather futures owned by the ROUTER listener.
+
+    A batch request is represented by one future per chunk.  The listener
+    keeps the request identity and reconstructs the batch response after all
+    futures finish, so the executor never submits work to itself.
+    """
+
+    identity: bytes
+    request: Any
+    futures: list[concurrent.futures.Future[Any]]
+    submitted_at: float
+    future_start_at: list[float]
+    future_done_at: list[float]
+    handler_elapsed_ms: list[float]
+    listener_received_at: float
+    decoded_at: float
+    submission_finished_at: float
+
+
 class KVCacheSendingThread(threading.Thread):
     def __init__(
         self,
@@ -274,6 +296,37 @@ class KVCacheSendingThread(threading.Thread):
         self.pcp_rank = pcp_rank
         self.port_send_num: dict[str, int] = {}
         self.staging_service = staging_service
+        if staging_service is None:
+            self._staging_executor = None
+        else:
+            # NPU device selection is thread-local.  Gather workers must use
+            # the same device as the P-side staging pool; CPU pools do not need
+            # an initializer.
+            staging_device = staging_service.pool.slot_view(0).device
+            executor_kwargs: dict[str, Any] = {
+                "max_workers": staging_service.pool.num_slots,
+                "thread_name_prefix": "staging-gather",
+            }
+            if getattr(staging_device, "type", None) == "npu":
+                executor_kwargs["initializer"] = torch.npu.set_device
+                executor_kwargs["initargs"] = (staging_device,)
+            self._staging_executor = concurrent.futures.ThreadPoolExecutor(**executor_kwargs)
+            logger.info(
+                "P staging gather executor initialized: workers=%d device=%s",
+                staging_service.pool.num_slots,
+                staging_device,
+            )
+        self._staging_futures: list[_PendingStagingGather] = []
+        self._staging_wakeup_fd: int | None = None
+        if staging_service is not None:
+            # Linux eventfd coalesces executor completion notifications without
+            # sharing a ZeroMQ socket across worker threads.
+            self._staging_wakeup_fd = os.eventfd(  # type: ignore[attr-defined]
+                0, os.EFD_NONBLOCK | os.EFD_CLOEXEC  # type: ignore[attr-defined]
+            )
+        # Retain the previous poll interval for phase timing diagnostics.
+        self._last_staging_poll_started_at = 0.0
+        self._last_staging_poll_finished_at = 0.0
 
         self.task_tracker = KVCacheTaskTracker()
 
@@ -293,6 +346,7 @@ class KVCacheSendingThread(threading.Thread):
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
+        path = "<not-created>"
         try:
             # Listen for new requests for metadata. NOTE(rob): we need each rank
             # to have a unique port. This hack to keeps us moving. We will
@@ -321,6 +375,9 @@ class KVCacheSendingThread(threading.Thread):
                 path,
                 e,
             )
+        finally:
+            if self._staging_executor is not None:
+                self._staging_executor.shutdown(wait=True, cancel_futures=True)
 
     def run_busy_loop(self, sock: zmq.Socket):  # type: ignore
         encoder = msgspec.msgpack.Encoder()
@@ -330,8 +387,25 @@ class KVCacheSendingThread(threading.Thread):
             logger.debug("Size of encoded MooncakeAgentMetadata: %s bytes", str(size_in_bytes))
 
         decoder = msgspec.msgpack.Decoder(type=tuple)
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        if self._staging_wakeup_fd is not None:
+            poller.register(self._staging_wakeup_fd, zmq.POLLIN)
         while True:
             try:
+                self._drain_staging_futures(sock)
+                poll_started_at = time.perf_counter()
+                poll_events = dict(poller.poll())
+                poll_finished_at = time.perf_counter()
+                self._last_staging_poll_started_at = poll_started_at
+                self._last_staging_poll_finished_at = poll_finished_at
+                if self._staging_wakeup_fd is not None and self._staging_wakeup_fd in poll_events:
+                    self._drain_staging_wakeup()
+                    self._drain_staging_futures(sock)
+                if sock not in poll_events:
+                    continue
+                poll_wait_ms = (poll_finished_at - poll_started_at) * 1000
+                listener_received_at = time.perf_counter()
                 frames = sock.recv_multipart()
                 if len(frames) < 2:
                     logger.error(
@@ -388,6 +462,14 @@ class KVCacheSendingThread(threading.Thread):
                             logger.debug("Socket not ready, retrying to send ACK for request %s", msg[1])
                             time.sleep(0.01)
                 elif msg[0] == STAGING_MSG:
+                    if self._submit_staging_gather(
+                        sock,
+                        identity,
+                        msg[1],
+                        poll_wait_ms=poll_wait_ms,
+                        listener_received_at=listener_received_at,
+                    ):
+                        continue
                     self._handle_staging_msg(sock, identity, msg[1])
                 else:
                     logger.error(
@@ -410,9 +492,355 @@ class KVCacheSendingThread(threading.Thread):
                     e,
                 )
 
+    def _submit_staging_gather(
+        self,
+        _sock: zmq.Socket,
+        identity: bytes,
+        payload: bytes,
+        *,
+        poll_wait_ms: float = 0.0,
+        listener_received_at: float | None = None,
+    ) -> bool:
+        """Submit PREPARE gather work without blocking the ROUTER listener."""
+        if self.staging_service is None or self._staging_executor is None:
+            return False
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+            PrepareReadBatchMsg,
+            PrepareReadMsg,
+            StagingMsgType,
+            decode_msg,
+            msg_type_of,
+        )
+
+        msg_type = msg_type_of(payload)
+        if msg_type not in (StagingMsgType.PREPARE_READ, StagingMsgType.PREPARE_READ_BATCH):
+            return False
+        msg = decode_msg(payload)
+        decoded_at = time.perf_counter()
+        submit_started_at = time.perf_counter()
+        future_start_at = [0.0] * (len(msg.chunks) if isinstance(msg, PrepareReadBatchMsg) else 1)
+        handler_elapsed_ms = [0.0] * len(future_start_at)
+
+        def run_gather(index: int, prepare_msg: PrepareReadMsg):
+            future_start_at[index] = time.perf_counter()
+            handler_started_at = time.perf_counter()
+            try:
+                return self.staging_service.handle_prepare_read(prepare_msg)
+            finally:
+                handler_elapsed_ms[index] = (time.perf_counter() - handler_started_at) * 1000
+
+        if msg_type == StagingMsgType.PREPARE_READ:
+            if not isinstance(msg, PrepareReadMsg):
+                raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
+            futures = [self._staging_executor.submit(run_gather, 0, msg)]
+        else:
+            if not isinstance(msg, PrepareReadBatchMsg):
+                raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
+            futures = [
+                self._staging_executor.submit(
+                    run_gather,
+                    index,
+                    PrepareReadMsg(
+                        transfer_id=msg.transfer_id,
+                        chunk_id=item.chunk_id,
+                        gather_entries=item.gather_entries,
+                        total_bytes=item.total_bytes,
+                    ),
+                )
+                for index, item in enumerate(msg.chunks)
+            ]
+        # Start the interval before the first submit.  A worker can begin
+        # running before ``submit`` returns, so recording this timestamp after
+        # all submits would produce negative queue times.
+        submission_finished_at = time.perf_counter()
+        future_done_at = [0.0] * len(futures)
+        for index, future in enumerate(futures):
+            def on_done(_future, index=index):
+                future_done_at[index] = time.perf_counter()
+                self._notify_staging_future_done()
+
+            future.add_done_callback(on_done)
+        logger.info(
+            "P staging gather submitted: transfer_id=%s kind=%s chunks=%d pending_batches=%d "
+            "poll_wait_ms=%.2f listener_to_submit_ms=%.2f executor_submit_ms=%.2f",
+            msg.transfer_id,
+            msg_type.name,
+            len(msg.chunks) if isinstance(msg, PrepareReadBatchMsg) else 1,
+            len(self._staging_futures) + 1,
+            poll_wait_ms,
+            (submit_started_at - listener_received_at) * 1000 if listener_received_at is not None else 0.0,
+            (submission_finished_at - submit_started_at) * 1000,
+        )
+        self._staging_futures.append(
+            _PendingStagingGather(
+                identity=identity,
+                request=msg,
+                futures=futures,
+                submitted_at=submit_started_at,
+                future_start_at=future_start_at,
+                future_done_at=future_done_at,
+                handler_elapsed_ms=handler_elapsed_ms,
+                listener_received_at=listener_received_at or submit_started_at,
+                decoded_at=decoded_at,
+                submission_finished_at=submission_finished_at,
+            )
+        )
+        return True
+
+    def _notify_staging_future_done(self) -> None:
+        if self._staging_wakeup_fd is None:
+            return
+        try:
+            os.eventfd_write(self._staging_wakeup_fd, 1)  # type: ignore[attr-defined]
+        except OSError:
+            logger.debug("Failed to signal P staging eventfd", exc_info=True)
+
+    def _drain_staging_wakeup(self) -> None:
+        if self._staging_wakeup_fd is None:
+            return
+        try:
+            while True:
+                os.eventfd_read(self._staging_wakeup_fd)  # type: ignore[attr-defined]
+        except BlockingIOError:
+            return
+
+    def _drain_staging_futures(self, sock: zmq.Socket) -> None:  # type: ignore
+        if not self._staging_futures:
+            return
+        pending: list[_PendingStagingGather] = []
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+            PackReadyBatchItem,
+            PackReadyBatchMsg,
+            PackReadyMsg,
+            PrepareReadBatchMsg,
+            PrepareReadMsg,
+            StagingErrorMsg,
+            encode_msg,
+        )
+
+        for gather in self._staging_futures:
+            if not all(future.done() for future in gather.futures):
+                pending.append(gather)
+                continue
+            drain_started_at = time.perf_counter()
+            latest_future_done_at = max(gather.future_done_at, default=0.0)
+            future_done_to_drain_ms = (
+                (drain_started_at - latest_future_done_at) * 1000 if latest_future_done_at else 0.0
+            )
+            poll_block_ms = 0.0
+            post_poll_to_drain_ms = 0.0
+            poll_start = self._last_staging_poll_started_at
+            poll_end = self._last_staging_poll_finished_at
+            if poll_start and poll_end:
+                done_during_poll = [
+                    done_at
+                    for done_at in gather.future_done_at
+                    if poll_start <= done_at <= poll_end
+                ]
+                if done_during_poll:
+                    poll_block_ms = (poll_end - max(done_during_poll)) * 1000
+                    post_poll_to_drain_ms = (drain_started_at - poll_end) * 1000
+            try:
+                responses: list[Any] = []
+                for index, future in enumerate(gather.futures):
+                    try:
+                        result = future.result()
+                        responses.append(result)
+                        if isinstance(gather.request, PrepareReadBatchMsg):
+                            item = gather.request.chunks[index]
+                            logger.info(
+                                "P staging gather completed: transfer_id=%s chunk_id=%d success=%s "
+                                "slot_addr=%s payload_bytes=%s gather_ms=%.2f",
+                                gather.request.transfer_id,
+                                item.chunk_id,
+                                isinstance(result, PackReadyMsg),
+                                f"0x{result.slot_addr:x}" if isinstance(result, PackReadyMsg) else "-",
+                                result.payload_bytes if isinstance(result, PackReadyMsg) else 0,
+                                result.gather_ms if isinstance(result, PackReadyMsg) else 0.0,
+                            )
+                    except Exception as exc:
+                        chunk_id = (
+                            gather.request.chunks[index].chunk_id
+                            if isinstance(gather.request, PrepareReadBatchMsg)
+                            else gather.request.chunk_id
+                        )
+                        logger.exception(
+                            "P staging gather failed: transfer_id=%s chunk_id=%d",
+                            gather.request.transfer_id,
+                            chunk_id,
+                        )
+                        responses.append(exc)
+
+                chunk_ids = (
+                    [item.chunk_id for item in gather.request.chunks]
+                    if isinstance(gather.request, PrepareReadBatchMsg)
+                    else [gather.request.chunk_id]
+                )
+                for index, chunk_id in enumerate(chunk_ids):
+                    task_started_at = gather.future_start_at[index]
+                    task_done_at = gather.future_done_at[index]
+                    logger.info(
+                        "P staging future timing: transfer_id=%s chunk_id=%d "
+                        "submit_to_start_ms=%.2f task_run_ms=%.2f done_to_drain_ms=%.2f "
+                        "last_poll_block_ms=%.2f post_poll_to_drain_ms=%.2f",
+                        gather.request.transfer_id,
+                        chunk_id,
+                        (task_started_at - gather.submitted_at) * 1000 if task_started_at else 0.0,
+                        (task_done_at - task_started_at) * 1000 if task_started_at and task_done_at else 0.0,
+                        (drain_started_at - task_done_at) * 1000 if task_done_at else 0.0,
+                        poll_block_ms,
+                        post_poll_to_drain_ms,
+                    )
+
+                if isinstance(gather.request, PrepareReadBatchMsg):
+                    results: list[PackReadyBatchItem] = []
+                    for item, response in zip(gather.request.chunks, responses):
+                        if isinstance(response, StagingErrorMsg):
+                            results.append(
+                                PackReadyBatchItem(
+                                    chunk_id=item.chunk_id,
+                                    success=False,
+                                    error_code=response.code,
+                                    error=response.reason,
+                                )
+                            )
+                        elif isinstance(response, Exception):
+                            results.append(
+                                PackReadyBatchItem(
+                                    chunk_id=item.chunk_id,
+                                    success=False,
+                                    error_code=4,
+                                    error=f"gather failed: {response}",
+                                )
+                            )
+                        elif isinstance(response, PackReadyMsg):
+                            results.append(
+                                PackReadyBatchItem(
+                                    chunk_id=item.chunk_id,
+                                    success=True,
+                                    slot_addr=response.slot_addr,
+                                    payload_bytes=response.payload_bytes,
+                                    gather_ms=response.gather_ms,
+                                )
+                            )
+                        else:
+                            results.append(
+                                PackReadyBatchItem(
+                                    chunk_id=item.chunk_id,
+                                    success=False,
+                                    error_code=4,
+                                    error=f"unexpected gather response: {type(response).__name__}",
+                                )
+                            )
+                    response = PackReadyBatchMsg(transfer_id=gather.request.transfer_id, results=results)
+                    logger.info(
+                        "P staging batch ready: transfer_id=%s chunks=%d success=%d failed=%d",
+                        gather.request.transfer_id,
+                        len(results),
+                        sum(item.success for item in results),
+                        sum(not item.success for item in results),
+                    )
+                elif isinstance(gather.request, PrepareReadMsg):
+                    response = responses[0]
+                    if isinstance(response, Exception) or not isinstance(
+                        response, (PackReadyMsg, StagingErrorMsg)
+                    ):
+                        response = StagingErrorMsg(
+                            transfer_id=gather.request.transfer_id,
+                            chunk_id=gather.request.chunk_id,
+                            code=4,
+                            reason=(
+                                f"gather failed: {response}"
+                                if isinstance(response, Exception)
+                                else f"unexpected gather response: {type(response).__name__}"
+                            ),
+                        )
+                    logger.info(
+                        "P staging ready: transfer_id=%s chunk_id=%d success=%s",
+                        gather.request.transfer_id,
+                        gather.request.chunk_id,
+                        isinstance(response, PackReadyMsg),
+                    )
+                response_encode_started_at = time.perf_counter()
+                response_payload = encode_msg(response)
+                response_encode_ms = (time.perf_counter() - response_encode_started_at) * 1000
+                response_send_started_at = time.perf_counter()
+                sock.send_multipart((gather.identity, b"", response_payload))
+                response_send_ms = (time.perf_counter() - response_send_started_at) * 1000
+                logger.info(
+                    "P staging response timing: transfer_id=%s kind=%s future_queue_ms=%.2f "
+                    "future_done_to_drain_ms=%.2f drain_to_encode_ms=%.2f response_encode_ms=%.2f "
+                    "response_send_ms=%.2f",
+                    gather.request.transfer_id,
+                    type(response).__name__,
+                    (drain_started_at - gather.submitted_at) * 1000,
+                    future_done_to_drain_ms,
+                    (response_encode_started_at - drain_started_at) * 1000,
+                    response_encode_ms,
+                    response_send_ms,
+                )
+                logger.info(
+                    "P staging chain timing: transfer_id=%s kind=%s chunks=%d "
+                    "listener_receive_to_decode_ms=%.2f decode_to_submit_ms=%.2f "
+                    "submit_to_start_ms=%.2f task_run_ms=%.2f pack_ms=%.2f handler_total_ms=%.2f "
+                    "future_done_to_drain_ms=%.2f drain_to_encode_ms=%.2f response_encode_ms=%.2f "
+                    "response_send_ms=%.2f "
+                    "total_ms=%.2f",
+                    gather.request.transfer_id,
+                    type(response).__name__,
+                    len(gather.futures),
+                    (gather.decoded_at - gather.listener_received_at) * 1000,
+                    (gather.submitted_at - gather.decoded_at) * 1000,
+                    min(
+                        (
+                            start - gather.submitted_at
+                            for start in gather.future_start_at
+                            if start
+                        ),
+                        default=0.0,
+                    )
+                    * 1000,
+                    max(
+                        (
+                            done - start
+                            for start, done in zip(gather.future_start_at, gather.future_done_at)
+                            if start and done
+                        ),
+                        default=0.0,
+                    )
+                    * 1000,
+                    max(
+                        (
+                            getattr(result, "gather_ms", 0.0)
+                            for result in responses
+                            if isinstance(result, PackReadyMsg)
+                        ),
+                        default=0.0,
+                    ),
+                    max(gather.handler_elapsed_ms, default=0.0),
+                    future_done_to_drain_ms,
+                    (response_encode_started_at - drain_started_at) * 1000,
+                    response_encode_ms,
+                    response_send_ms,
+                    (time.perf_counter() - gather.listener_received_at) * 1000,
+                )
+                logger.debug(
+                    "P staging response sent: transfer_id=%s kind=%s",
+                    gather.request.transfer_id,
+                    type(response).__name__,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to send P-side staging gather response: transfer_id=%s",
+                    getattr(gather.request, "transfer_id", "unknown"),
+                )
+        self._staging_futures = pending
+
     def _handle_staging_msg(self, sock: zmq.Socket, identity: bytes, payload: bytes) -> None:
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+            PrepareReadBatchMsg,
             PrepareReadMsg,
+            ReadAckBatchMsg,
             ReadAckMsg,
             StagingMsgType,
             decode_msg,
@@ -431,11 +859,38 @@ class KVCacheSendingThread(threading.Thread):
             if not isinstance(msg, PrepareReadMsg):
                 raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
             sock.send_multipart((identity, b"", encode_msg(self.staging_service.handle_prepare_read(msg))))
+        elif msg_type == StagingMsgType.PREPARE_READ_BATCH:
+            msg = decode_msg(payload)
+            if not isinstance(msg, PrepareReadBatchMsg):
+                raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
+            sock.send_multipart((identity, b"", encode_msg(self.staging_service.handle_prepare_read_batch(msg))))
         elif msg_type == StagingMsgType.READ_ACK:
             msg = decode_msg(payload)
             if not isinstance(msg, ReadAckMsg):
                 raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
+            logger.info(
+                "P staging ACK received: transfer_id=%s chunk_id=%d success=%s",
+                msg.transfer_id,
+                msg.chunk_id,
+                msg.success,
+            )
             self.staging_service.handle_read_ack(msg)
+            sock.send_multipart((identity, b"", b"ACK"))
+        elif msg_type == StagingMsgType.READ_ACK_BATCH:
+            msg = decode_msg(payload)
+            if not isinstance(msg, ReadAckBatchMsg):
+                raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
+            logger.info(
+                "P staging batch ACK received: transfer_id=%s chunks=%d success=%d failed=%d",
+                msg.transfer_id,
+                len(msg.results),
+                sum(item.success for item in msg.results),
+                sum(not item.success for item in msg.results),
+            )
+            for item in msg.results:
+                self.staging_service.handle_read_ack(
+                    ReadAckMsg(transfer_id=msg.transfer_id, chunk_id=item.chunk_id, success=item.success)
+                )
             sock.send_multipart((identity, b"", b"ACK"))
         else:
             logger.error("Unexpected staging message type: %s", msg_type)
@@ -464,6 +919,7 @@ class KVCacheRecvingThread(threading.Thread):
         block_size_scale: list[list[int]] | None = None,
         staging_coordinator: Any = None,
         staging_enabled: bool = False,
+        staging_min_direct_size: int | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
         self.tp_rank = tp_rank
@@ -475,6 +931,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.engine = engine
         self.staging_coordinator = staging_coordinator
         self.staging_enabled = staging_enabled
+        self.staging_min_direct_size = staging_min_direct_size
         if ready_event is None:
             ready_event = threading.Event()
         self.ready_event = ready_event
@@ -813,6 +1270,7 @@ class KVCacheRecvingThread(threading.Thread):
 
     def _transfer_kv_cache_all_groups(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
+        transfer_started_at = time.perf_counter()
         remote_request_id = req_meta["remote_request_id"]
         local_block_ids: BlockIds = req_meta["local_block_ids"]
         remote_block_ids: BlockIds = req_meta["remote_block_ids"]
@@ -829,14 +1287,37 @@ class KVCacheRecvingThread(threading.Thread):
         if num_local_blocks == 0 and not has_replicate_k_blocks:
             return
 
-        # Check if we have the remote metadata cached.
+        # Check if we have the remote metadata cached.  Keep this timing
+        # separate because a cache miss includes a control-plane round trip.
+        metadata_check_started_at = time.perf_counter()
         with self.remote_metadata_lock:
             has_remote_metadata = (
                 remote_engine_id in self.kv_caches_base_addr
                 and remote_handshake_port in self.kv_caches_base_addr[remote_engine_id]
             )
+        metadata_cache_check_ms = (time.perf_counter() - metadata_check_started_at) * 1000
+        metadata_get_ms = 0.0
         if not has_remote_metadata:
+            logger.info(
+                "Mooncake remote metadata cache miss: request=%s remote_engine=%s "
+                "remote_host=%s remote_handshake_port=%d",
+                remote_request_id,
+                remote_engine_id,
+                remote_host,
+                remote_handshake_port,
+            )
+            metadata_get_started_at = time.perf_counter()
             self._get_remote_metadata(remote_host, remote_handshake_port)
+            metadata_get_ms = (time.perf_counter() - metadata_get_started_at) * 1000
+        else:
+            logger.debug(
+                "Mooncake remote metadata cache hit: request=%s remote_engine=%s "
+                "remote_host=%s remote_handshake_port=%d",
+                remote_request_id,
+                remote_engine_id,
+                remote_host,
+                remote_handshake_port,
+            )
         with self.remote_metadata_lock:
             remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
             local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
@@ -844,7 +1325,30 @@ class KVCacheRecvingThread(threading.Thread):
             remote_block_stride_per_addr = self.remote_block_stride_per_addr[remote_engine_id][remote_handshake_port]
         session_id = f"{remote_host}:{remote_transfer_port}"
 
-        req_start_time = time.perf_counter()
+        logger.info(
+            "Mooncake transfer endpoint: request=%s remote_engine=%s "
+            "remote_host=%s remote_handshake_port=%d remote_te_port=%d session_id=%s",
+            remote_request_id,
+            remote_engine_id,
+            remote_host,
+            remote_handshake_port,
+            remote_transfer_port,
+            session_id,
+        )
+
+        logger.info(
+            "D metadata timing: transfer_id=%s cache=%s cache_check_ms=%.2f get_ms=%.2f "
+            "total_ms=%.2f",
+            remote_request_id,
+            "hit" if has_remote_metadata else "miss",
+            metadata_cache_check_ms,
+            metadata_get_ms,
+            (time.perf_counter() - metadata_check_started_at) * 1000,
+        )
+        metadata_total_ms = metadata_cache_check_ms + metadata_get_ms
+
+        req_start_time = transfer_started_at
+        address_plan_started_at = time.perf_counter()
         src_list: list[int] = []
         dst_list: list[int] = []
         length_list: list[int] = []
@@ -989,6 +1493,15 @@ class KVCacheRecvingThread(threading.Thread):
                         session_id,
                     )
         if not src_list:
+            logger.info(
+                "D transfer summary: transfer_id=%s metadata_ms=%.2f metadata_to_plan_ms=%.2f "
+                "plan_ms=0.00 direct_ms=0.00 staging_ms=0.00 total_ms=%.2f "
+                "direct_bytes=0 direct_entries=0 packed_bytes=0 packed_entries=0 packed_chunks=0 success=true",
+                remote_request_id,
+                metadata_total_ms,
+                (time.perf_counter() - address_plan_started_at) * 1000,
+                (time.perf_counter() - transfer_started_at) * 1000,
+            )
             return
 
         logger.debug(
@@ -1015,9 +1528,14 @@ class KVCacheRecvingThread(threading.Thread):
                 src_list,
                 dst_list,
                 length_list,
+                address_plan_ms=(time.perf_counter() - address_plan_started_at) * 1000,
+                metadata_ms=metadata_total_ms,
+                transfer_started_at=transfer_started_at,
             )
         else:
+            direct_started_at = time.perf_counter()
             ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+            direct_elapsed_ms = (time.perf_counter() - direct_started_at) * 1000
             if ret < 0:
                 logger.error(
                     "Mooncake transfer failed for request. remote_request_id=%s, ret=%d. ",
@@ -1025,6 +1543,18 @@ class KVCacheRecvingThread(threading.Thread):
                     ret,
                 )
                 raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+            logger.info(
+                "D transfer summary: transfer_id=%s metadata_ms=%.2f metadata_to_plan_ms=%.2f "
+                "plan_ms=0.00 direct_ms=%.2f staging_ms=0.00 total_ms=%.2f "
+                "direct_bytes=%d direct_entries=%d packed_bytes=0 packed_entries=0 packed_chunks=0 success=true",
+                remote_request_id,
+                metadata_total_ms,
+                (time.perf_counter() - address_plan_started_at) * 1000,
+                direct_elapsed_ms,
+                (time.perf_counter() - transfer_started_at) * 1000,
+                sum(length_list),
+                len(length_list),
+            )
 
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
@@ -1147,11 +1677,18 @@ class KVCacheRecvingThread(threading.Thread):
         src_list: list[int],
         dst_list: list[int],
         length_list: list[int],
+        *,
+        address_plan_ms: float,
+        metadata_ms: float,
+        transfer_started_at: float,
     ) -> None:
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.adapter import plan_from_flat_entries
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+            PackReadyBatchMsg,
             PackReadyMsg,
+            PrepareReadBatchMsg,
             PrepareReadMsg,
+            ReadAckBatchMsg,
             ReadAckMsg,
             StagingErrorMsg,
             StagingMsgType,
@@ -1165,14 +1702,19 @@ class KVCacheRecvingThread(threading.Thread):
         # dst_list = remote (P) addresses.  For the staging planner the
         # semantics are reversed: src = P-side KV cache (gather source) and
         # dst = D-side KV cache (scatter destination).
+        if self.staging_min_direct_size is None:
+            raise RuntimeError("staging_min_direct_size is required for staging transfers")
+        plan_started_at = time.perf_counter()
         plan = plan_from_flat_entries(
             dst_list,
             src_list,
             length_list,
             request_id=remote_request_id,
             peer_session=session_id,
+            min_direct_size=self.staging_min_direct_size,
             chunk_capacity=self.staging_coordinator.pool.slot_capacity,
         )
+        plan_ms = (time.perf_counter() - plan_started_at) * 1000
 
         logger.info(
             "Staging plan: transfer_id=%s, direct_runs=%d, packed_chunks=%d, entries=%d",
@@ -1182,21 +1724,87 @@ class KVCacheRecvingThread(threading.Thread):
             len(src_list),
         )
 
+        direct_elapsed_ms = 0.0
+
         def direct_transfer(s_addrs: list[int], d_addrs: list[int], lens: list[int]) -> int:
-            return self.engine.batch_transfer_sync_read(session_id, s_addrs, d_addrs, lens)
+            nonlocal direct_elapsed_ms
+            direct_started_at = time.perf_counter()
+            total_bytes = sum(lens)
+            logger.info(
+                "D direct transfer start: transfer_id=%s session=%s descriptors=%d bytes=%d "
+                "length_min=%d length_max=%d src_range=0x%x-0x%x dst_range=0x%x-0x%x",
+                remote_request_id,
+                session_id,
+                len(lens),
+                total_bytes,
+                min(lens, default=0),
+                max(lens, default=0),
+                min(s_addrs, default=0),
+                max(s_addrs, default=0),
+                min(d_addrs, default=0),
+                max(d_addrs, default=0),
+            )
+            # Planner addresses use data direction (P source -> D destination),
+            # while Mooncake READ expects (D local destination, P peer source).
+            ret = self.engine.batch_transfer_sync_read(session_id, d_addrs, s_addrs, lens)
+            elapsed_ms = (time.perf_counter() - direct_started_at) * 1000
+            direct_elapsed_ms += elapsed_ms
+            logger.info(
+                "D direct transfer done: transfer_id=%s session=%s descriptors=%d bytes=%d "
+                "elapsed_ms=%.2f ret=%d first_src=0x%x first_dst=0x%x first_len=%d "
+                "last_src=0x%x last_dst=0x%x last_len=%d",
+                remote_request_id,
+                session_id,
+                len(lens),
+                total_bytes,
+                elapsed_ms,
+                ret,
+                s_addrs[0] if s_addrs else 0,
+                d_addrs[0] if d_addrs else 0,
+                lens[0] if lens else 0,
+                s_addrs[-1] if s_addrs else 0,
+                d_addrs[-1] if d_addrs else 0,
+                lens[-1] if lens else 0,
+            )
+            if ret != 0:
+                logger.error(
+                    "D direct transfer failed: transfer_id=%s session=%s descriptors=%d bytes=%d "
+                    "elapsed_ms=%.2f ret=%d; staging fragments were not executed",
+                    remote_request_id,
+                    session_id,
+                    len(lens),
+                    total_bytes,
+                    elapsed_ms,
+                    ret,
+                )
+            return ret
 
         def prepare_read(msg: PrepareReadMsg):
+            rpc_started_at = time.perf_counter()
+            socket_get_ms = encode_ms = zmq_send_ms = zmq_recv_wait_ms = decode_ms = socket_return_ms = 0.0
+            sock = None
             logger.info(
                 "D-side PREPARE_READ: transfer_id=%s, chunk_id=%d, total_bytes=%d",
                 msg.transfer_id, msg.chunk_id, msg.total_bytes,
             )
+            socket_started_at = time.perf_counter()
             sock = self._get_remote_socket(remote_host, remote_handshake_port)
+            socket_get_ms = (time.perf_counter() - socket_started_at) * 1000
             try:
-                ensure_zmq_send(sock, self.encoder.encode((STAGING_MSG, encode_msg(msg))), f"{remote_host}:{remote_handshake_port}")
+                encode_started_at = time.perf_counter()
+                payload = self.encoder.encode((STAGING_MSG, encode_msg(msg)))
+                encode_ms = (time.perf_counter() - encode_started_at) * 1000
+                send_started_at = time.perf_counter()
+                ensure_zmq_send(sock, payload, f"{remote_host}:{remote_handshake_port}")
+                zmq_send_ms = (time.perf_counter() - send_started_at) * 1000
+                recv_started_at = time.perf_counter()
                 response = ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
+                zmq_recv_wait_ms = (time.perf_counter() - recv_started_at) * 1000
                 if response == b"ERR_NO_STAGING":
                     return StagingErrorMsg(msg.transfer_id, msg.chunk_id, 2, "peer has no staging")
+                decode_started_at = time.perf_counter()
                 decoded = decode_msg(response)
+                decode_ms = (time.perf_counter() - decode_started_at) * 1000
                 if msg_type_of(response) == StagingMsgType.ERROR:
                     if not isinstance(decoded, StagingErrorMsg):
                         raise ValueError(f"Unexpected staging error: {type(decoded).__name__}")
@@ -1209,23 +1817,181 @@ class KVCacheRecvingThread(threading.Thread):
                 )
                 return decoded
             finally:
-                self._return_remote_socket(sock, remote_host, remote_handshake_port)
+                if sock is not None:
+                    return_started_at = time.perf_counter()
+                    self._return_remote_socket(sock, remote_host, remote_handshake_port)
+                    socket_return_ms = (time.perf_counter() - return_started_at) * 1000
+                logger.info(
+                    "D PREPARE control timing: transfer_id=%s kind=single chunk_id=%d "
+                    "socket_get_ms=%.2f encode_ms=%.2f zmq_send_ms=%.2f zmq_recv_wait_ms=%.2f "
+                    "decode_ms=%.2f socket_return_ms=%.2f total_ms=%.2f",
+                    msg.transfer_id,
+                    msg.chunk_id,
+                    socket_get_ms,
+                    encode_ms,
+                    zmq_send_ms,
+                    zmq_recv_wait_ms,
+                    decode_ms,
+                    socket_return_ms,
+                    (time.perf_counter() - rpc_started_at) * 1000,
+                )
+
+        def prepare_read_batch(msg: PrepareReadBatchMsg):
+            rpc_started_at = time.perf_counter()
+            socket_get_ms = encode_ms = zmq_send_ms = zmq_recv_wait_ms = decode_ms = socket_return_ms = 0.0
+            sock = None
+            logger.info(
+                "D-side PREPARE_READ_BATCH: transfer_id=%s chunks=%d bytes=%d",
+                msg.transfer_id,
+                len(msg.chunks),
+                sum(item.total_bytes for item in msg.chunks),
+            )
+            socket_started_at = time.perf_counter()
+            sock = self._get_remote_socket(remote_host, remote_handshake_port)
+            socket_get_ms = (time.perf_counter() - socket_started_at) * 1000
+            try:
+                encode_started_at = time.perf_counter()
+                payload = self.encoder.encode((STAGING_MSG, encode_msg(msg)))
+                encode_ms = (time.perf_counter() - encode_started_at) * 1000
+                send_started_at = time.perf_counter()
+                ensure_zmq_send(
+                    sock,
+                    payload,
+                    f"{remote_host}:{remote_handshake_port}",
+                )
+                zmq_send_ms = (time.perf_counter() - send_started_at) * 1000
+                recv_started_at = time.perf_counter()
+                response = ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
+                zmq_recv_wait_ms = (time.perf_counter() - recv_started_at) * 1000
+                if response == b"ERR_NO_STAGING":
+                    raise RuntimeError("peer has no staging")
+                decode_started_at = time.perf_counter()
+                decoded = decode_msg(response)
+                decode_ms = (time.perf_counter() - decode_started_at) * 1000
+                if not isinstance(decoded, PackReadyBatchMsg):
+                    raise ValueError(f"Unexpected staging batch response: {type(decoded).__name__}")
+                return decoded
+            finally:
+                if sock is not None:
+                    return_started_at = time.perf_counter()
+                    self._return_remote_socket(sock, remote_host, remote_handshake_port)
+                    socket_return_ms = (time.perf_counter() - return_started_at) * 1000
+                logger.info(
+                    "D PREPARE control timing: transfer_id=%s kind=batch chunks=%d "
+                    "socket_get_ms=%.2f encode_ms=%.2f zmq_send_ms=%.2f zmq_recv_wait_ms=%.2f "
+                    "decode_ms=%.2f socket_return_ms=%.2f total_ms=%.2f",
+                    msg.transfer_id,
+                    len(msg.chunks),
+                    socket_get_ms,
+                    encode_ms,
+                    zmq_send_ms,
+                    zmq_recv_wait_ms,
+                    decode_ms,
+                    socket_return_ms,
+                    (time.perf_counter() - rpc_started_at) * 1000,
+                )
 
         def rdma_read(local_dst: int, remote_src: int, nbytes: int) -> int:
             return self.engine.batch_transfer_sync_read(session_id, [local_dst], [remote_src], [nbytes])
 
+        def rdma_read_batch(local_dsts: list[int], remote_srcs: list[int], nbytes: list[int]) -> int:
+            logger.info(
+                "D-side RDMA_READ_BATCH: transfer_id=%s chunks=%d bytes=%d",
+                remote_request_id,
+                len(nbytes),
+                sum(nbytes),
+            )
+            return self.engine.batch_transfer_sync_read(session_id, local_dsts, remote_srcs, nbytes)
+
         def send_ack(msg: ReadAckMsg) -> None:
+            rpc_started_at = time.perf_counter()
+            socket_get_ms = encode_ms = zmq_send_ms = zmq_recv_wait_ms = decode_ms = socket_return_ms = 0.0
+            sock = None
             logger.info(
                 "D-side READ_ACK: transfer_id=%s, chunk_id=%d, success=%s",
                 msg.transfer_id, msg.chunk_id, msg.success,
             )
+            socket_started_at = time.perf_counter()
             sock = self._get_remote_socket(remote_host, remote_handshake_port)
+            socket_get_ms = (time.perf_counter() - socket_started_at) * 1000
             try:
-                ensure_zmq_send(sock, self.encoder.encode((STAGING_MSG, encode_msg(msg))), f"{remote_host}:{remote_handshake_port}")
+                encode_started_at = time.perf_counter()
+                payload = self.encoder.encode((STAGING_MSG, encode_msg(msg)))
+                encode_ms = (time.perf_counter() - encode_started_at) * 1000
+                send_started_at = time.perf_counter()
+                ensure_zmq_send(sock, payload, f"{remote_host}:{remote_handshake_port}")
+                zmq_send_ms = (time.perf_counter() - send_started_at) * 1000
+                recv_started_at = time.perf_counter()
                 ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
+                zmq_recv_wait_ms = (time.perf_counter() - recv_started_at) * 1000
             finally:
-                self._return_remote_socket(sock, remote_host, remote_handshake_port)
+                if sock is not None:
+                    return_started_at = time.perf_counter()
+                    self._return_remote_socket(sock, remote_host, remote_handshake_port)
+                    socket_return_ms = (time.perf_counter() - return_started_at) * 1000
+                logger.info(
+                    "D ACK control timing: transfer_id=%s kind=single chunk_id=%d "
+                    "socket_get_ms=%.2f encode_ms=%.2f zmq_send_ms=%.2f zmq_recv_wait_ms=%.2f "
+                    "decode_ms=%.2f socket_return_ms=%.2f total_ms=%.2f",
+                    msg.transfer_id,
+                    msg.chunk_id,
+                    socket_get_ms,
+                    encode_ms,
+                    zmq_send_ms,
+                    zmq_recv_wait_ms,
+                    decode_ms,
+                    socket_return_ms,
+                    (time.perf_counter() - rpc_started_at) * 1000,
+                )
 
+        def send_ack_batch(msg: ReadAckBatchMsg) -> None:
+            rpc_started_at = time.perf_counter()
+            socket_get_ms = encode_ms = zmq_send_ms = zmq_recv_wait_ms = decode_ms = socket_return_ms = 0.0
+            sock = None
+            logger.info(
+                "D-side READ_ACK_BATCH: transfer_id=%s chunks=%d success=%d",
+                msg.transfer_id,
+                len(msg.results),
+                sum(item.success for item in msg.results),
+            )
+            socket_started_at = time.perf_counter()
+            sock = self._get_remote_socket(remote_host, remote_handshake_port)
+            socket_get_ms = (time.perf_counter() - socket_started_at) * 1000
+            try:
+                encode_started_at = time.perf_counter()
+                payload = self.encoder.encode((STAGING_MSG, encode_msg(msg)))
+                encode_ms = (time.perf_counter() - encode_started_at) * 1000
+                send_started_at = time.perf_counter()
+                ensure_zmq_send(
+                    sock,
+                    payload,
+                    f"{remote_host}:{remote_handshake_port}",
+                )
+                zmq_send_ms = (time.perf_counter() - send_started_at) * 1000
+                recv_started_at = time.perf_counter()
+                ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
+                zmq_recv_wait_ms = (time.perf_counter() - recv_started_at) * 1000
+            finally:
+                if sock is not None:
+                    return_started_at = time.perf_counter()
+                    self._return_remote_socket(sock, remote_host, remote_handshake_port)
+                    socket_return_ms = (time.perf_counter() - return_started_at) * 1000
+                logger.info(
+                    "D ACK control timing: transfer_id=%s kind=batch chunks=%d "
+                    "socket_get_ms=%.2f encode_ms=%.2f zmq_send_ms=%.2f zmq_recv_wait_ms=%.2f "
+                    "decode_ms=%.2f socket_return_ms=%.2f total_ms=%.2f",
+                    msg.transfer_id,
+                    len(msg.results),
+                    socket_get_ms,
+                    encode_ms,
+                    zmq_send_ms,
+                    zmq_recv_wait_ms,
+                    decode_ms,
+                    socket_return_ms,
+                    (time.perf_counter() - rpc_started_at) * 1000,
+                )
+
+        staging_started_at = time.perf_counter()
         result = self.staging_coordinator.execute(
             plan,
             transfer_id=remote_request_id,
@@ -1233,10 +1999,38 @@ class KVCacheRecvingThread(threading.Thread):
             prepare_read=prepare_read,
             rdma_read=rdma_read,
             send_ack=send_ack,
+            prepare_read_batch=prepare_read_batch,
+            send_ack_batch=send_ack_batch,
+            rdma_read_batch=rdma_read_batch,
+            batch_window_size=self.staging_coordinator.pool.num_slots,
         )
+        staging_executor_ms = (time.perf_counter() - staging_started_at) * 1000
+        # The coordinator executes direct runs before packed chunks.  Report
+        # the packed staging portion separately so direct_ms + staging_ms is
+        # not double-counted in the end-to-end summary.
+        staging_elapsed_ms = max(0.0, staging_executor_ms - direct_elapsed_ms)
         logger.info(
             "Staging transfer done: transfer_id=%s, success=%s",
             remote_request_id, result.success,
+        )
+        logger.info(
+            "D transfer summary: transfer_id=%s metadata_ms=%.2f metadata_to_plan_ms=%.2f "
+            "plan_ms=%.2f direct_ms=%.2f staging_ms=%.2f staging_executor_ms=%.2f total_ms=%.2f "
+            "direct_bytes=%d direct_entries=%d packed_bytes=%d packed_entries=%d packed_chunks=%d success=%s",
+            remote_request_id,
+            metadata_ms,
+            address_plan_ms,
+            plan_ms,
+            direct_elapsed_ms,
+            staging_elapsed_ms,
+            staging_executor_ms,
+            (time.perf_counter() - transfer_started_at) * 1000,
+            result.direct_bytes,
+            result.direct_entries,
+            result.packed_bytes,
+            result.packed_entries,
+            len(plan.packed_chunks),
+            result.success,
         )
         if not result.success:
             raise RuntimeError(f"Staged transfer failed for {remote_request_id}: {result.error}")
@@ -1552,6 +2346,14 @@ class KVCacheRecvingThread(threading.Thread):
                 self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
                 self.remote_block_size_scale[engine_id][remote_handshake_port] = agent_meta.block_size_scale
                 self.remote_block_stride_per_addr[engine_id][remote_handshake_port] = agent_meta.block_strides
+            logger.info(
+                "Mooncake remote metadata updated: remote_engine=%s remote_host=%s "
+                "remote_handshake_port=%d remote_te_port=%d",
+                engine_id,
+                remote_host,
+                remote_handshake_port,
+                agent_meta.te_rpc_port,
+            )
         except Exception:
             if isinstance(sock, zmq.Socket):  # type: ignore
                 sock.close()
@@ -2593,9 +3395,10 @@ class MooncakeConnectorWorker:
 
         staging_service = None
         staging_coordinator = None
-        staging_enabled = staging_config_from_env().enabled
+        staging_config = staging_config_from_env()
+        staging_enabled = staging_config.enabled
         if staging_enabled:
-            staging_service, staging_coordinator = self._create_staging_components(kv_caches)
+            staging_service, staging_coordinator = self._create_staging_components(kv_caches, staging_config)
 
         ready_event = threading.Event()
         if self.kv_role == "kv_producer":
@@ -2634,6 +3437,7 @@ class MooncakeConnectorWorker:
                 self.block_size_scale,
                 staging_coordinator=staging_coordinator,
                 staging_enabled=staging_enabled,
+                staging_min_direct_size=staging_config.min_direct_size,
             )
             self.kv_recv_thread.start()
         start_wait_time = time.time()
@@ -2646,13 +3450,11 @@ class MooncakeConnectorWorker:
                 raise RuntimeError("Timeout waiting for KV Cache thread to be ready.")
             time.sleep(3)
 
-    def _create_staging_components(self, kv_caches: dict[str, torch.Tensor]) -> tuple[Any, Any]:
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.budget import staging_config_from_env
+    def _create_staging_components(self, kv_caches: dict[str, torch.Tensor], config: Any) -> tuple[Any, Any]:
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.d_coordinator import DecodeStagingCoordinator
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.p_service import PrefillStagingService
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
 
-        config = staging_config_from_env()
         first_value = next(iter(kv_caches.values()))
         first_tensor = self._as_kv_cache_tuple(first_value)[0]
         device = first_tensor.device
