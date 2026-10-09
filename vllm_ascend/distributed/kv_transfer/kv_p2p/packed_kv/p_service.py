@@ -16,6 +16,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from collections.abc import Callable
 
 import torch
 from vllm.logger import logger
@@ -27,8 +28,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.copy import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
     GatherEntry,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
+from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator, StagingLease
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+    STAGING_ERR_ARENA_EXHAUSTED,
     PackReadyMsg,
     PackReadyBatchItem,
     PackReadyBatchMsg,
@@ -39,10 +41,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
 )
 
 @dataclass
-class _ActiveSlot:
-    """Tracks a slot that has been gathered and exposed for RDMA read."""
+class _ActiveLease:
+    """Tracks a gathered extent exposed for RDMA read."""
 
-    slot_id: int
+    lease: StagingLease
     transfer_id: str
     chunk_id: int
     ready: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -55,29 +57,65 @@ class PrefillStagingService:
 
     Parameters
     ----------
-    pool : StagingPool
-        The P-side staging pool (HBM buffer registered with TE).
+    allocator : StagingAllocator
+        The P-side staging arena registered with TE.
     kv_tensor : torch.Tensor
         Flat view of the P-side KV cache (all layers/components).
     kv_base_addr : int
         ``kv_tensor.data_ptr()`` — base address for offset computation.
     """
 
-    pool: StagingPool
+    allocator: StagingAllocator
     kv_tensor: torch.Tensor
     kv_base_addr: int
     kv_regions: list[tuple[int, torch.Tensor]] = field(default_factory=list, init=True)
-    _active_slots: dict[tuple[str, int], _ActiveSlot] = field(default_factory=dict, init=False)
-    _active_slots_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    max_concurrent_chunks: int = 1
+    on_transfer_staged: Callable[[str], None] | None = None
+    _active_leases: dict[tuple[str, int], _ActiveLease] = field(default_factory=dict, init=False)
+    _active_leases_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _staged_chunks: dict[str, set[int]] = field(default_factory=dict, init=False, repr=False)
+    _staged_expected: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _staged_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def _record_staged_chunk(self, msg: PrepareReadMsg) -> None:
+        """Notify the scheduler path when an all-staging request is gathered."""
+        if not msg.release_source_when_ready or msg.expected_chunks <= 0:
+            return
+        callback = None
+        with self._staged_lock:
+            expected = self._staged_expected.setdefault(msg.transfer_id, msg.expected_chunks)
+            if expected != msg.expected_chunks:
+                logger.warning(
+                    "P staging source-release chunk count changed: transfer=%s expected=%d got=%d",
+                    msg.transfer_id,
+                    expected,
+                    msg.expected_chunks,
+                )
+                return
+            gathered = self._staged_chunks.setdefault(msg.transfer_id, set())
+            if msg.chunk_id in gathered:
+                return
+            gathered.add(msg.chunk_id)
+            if len(gathered) == expected:
+                self._staged_chunks.pop(msg.transfer_id, None)
+                self._staged_expected.pop(msg.transfer_id, None)
+                callback = self.on_transfer_staged
+        if callback is not None:
+            logger.info(
+                "P staging source transfer complete after gather: transfer=%s chunks=%d",
+                msg.transfer_id,
+                msg.expected_chunks,
+            )
+            try:
+                callback(msg.transfer_id)
+            except Exception:
+                logger.exception("P staging source completion callback failed: transfer=%s", msg.transfer_id)
 
     def _validate_prepare_read(self, msg: PrepareReadMsg) -> str | None:
         if msg.total_bytes <= 0:
             return "payload must be positive"
-        if msg.total_bytes > self.pool.slot_capacity:
-            return (
-                f"payload exceeds staging slot capacity: payload={msg.total_bytes}, "
-                f"capacity={self.pool.slot_capacity}"
-            )
+        if msg.total_bytes > self.allocator.capacity_bytes:
+            return f"payload exceeds staging arena capacity: payload={msg.total_bytes}, capacity={self.allocator.capacity_bytes}"
 
         regions = self.kv_regions
         if not regions and self.kv_tensor.numel() > 0:
@@ -127,29 +165,45 @@ class PrefillStagingService:
                 reason=error,
             )
 
-        slot_started_at = time.perf_counter()
-        with self._active_slots_lock:
-            existing = self._active_slots.get(key)
-            if existing is not None:
-                slot = None
-            else:
-                slot = self.pool.acquire()
-                if slot is None:
+        allocation_started_at = time.perf_counter()
+        is_owner = False
+        with self._active_leases_lock:
+            existing = self._active_leases.get(key)
+            if existing is None:
+                lease = self.allocator.allocate(msg.total_bytes)
+                if lease is None:
+                    logger.info(
+                        "P staging arena has no contiguous extent: transfer=%s chunk=%d "
+                        "bytes=%d free_bytes=%d capacity_bytes=%d",
+                        msg.transfer_id,
+                        msg.chunk_id,
+                        msg.total_bytes,
+                        self.allocator.free_bytes,
+                        self.allocator.capacity_bytes,
+                    )
                     return StagingErrorMsg(
                         transfer_id=msg.transfer_id,
                         chunk_id=msg.chunk_id,
-                        code=1,
-                        reason="no staging slot available",
+                        code=STAGING_ERR_ARENA_EXHAUSTED,
+                        reason="staging arena has no contiguous extent available",
                     )
-                existing = _ActiveSlot(
-                    slot_id=slot.slot_id,
+                existing = _ActiveLease(
+                    lease=lease,
                     transfer_id=msg.transfer_id,
                     chunk_id=msg.chunk_id,
                 )
-                self._active_slots[key] = existing
-        slot_finished_at = time.perf_counter()
+                self._active_leases[key] = existing
+                is_owner = True
+            elif existing.lease.payload_bytes != msg.total_bytes:
+                return StagingErrorMsg(
+                    transfer_id=msg.transfer_id,
+                    chunk_id=msg.chunk_id,
+                    code=3,
+                    reason="duplicate prepare changed payload size",
+                )
+        allocation_finished_at = time.perf_counter()
 
-        if slot is None:
+        if not is_owner:
             wait_started_at = time.perf_counter()
             existing.ready.wait()
             wait_finished_at = time.perf_counter()
@@ -167,16 +221,19 @@ class PrefillStagingService:
                 msg.transfer_id,
                 msg.chunk_id,
                 (validation_finished_at - validation_started_at) * 1000,
-                (slot_finished_at - slot_started_at) * 1000,
+                (allocation_finished_at - allocation_started_at) * 1000,
                 (wait_finished_at - wait_started_at) * 1000,
                 (time.perf_counter() - handler_started_at) * 1000,
             )
             return PackReadyMsg(
                 transfer_id=msg.transfer_id,
                 chunk_id=msg.chunk_id,
-                slot_addr=self.pool.slot_ptr(existing.slot_id),
+                lease_id=existing.lease.lease_id,
+                staging_addr=self.allocator.address(existing.lease),
                 payload_bytes=msg.total_bytes,
             )
+
+        lease = existing.lease
 
         entry_started_at = time.perf_counter()
         gather_entries = [
@@ -185,7 +242,7 @@ class PrefillStagingService:
         entry_finished_at = time.perf_counter()
 
         slot_view_started_at = time.perf_counter()
-        staging_view = self.pool.slot_view(slot.slot_id)
+        staging_view = self.allocator.view(lease)
         slot_view_finished_at = time.perf_counter()
         t_gather = time.perf_counter()
         gather_timing: dict[str, float] = {}
@@ -201,12 +258,12 @@ class PrefillStagingService:
                     timing=gather_timing,
                 )
         except Exception:
-            with self._active_slots_lock:
-                active = self._active_slots.pop(key, None)
+            with self._active_leases_lock:
+                active = self._active_leases.pop(key, None)
             if active is not None:
                 active.error = "gather failed"
                 active.ready.set()
-                self.pool.release(active.slot_id)
+                self.allocator.release(active.lease)
             raise
 
         gather_ms = (time.perf_counter() - t_gather) * 1000
@@ -241,8 +298,9 @@ class PrefillStagingService:
         )
 
         existing.ready.set()
+        self._record_staged_chunk(msg)
 
-        slot_addr = self.pool.slot_ptr(slot.slot_id)
+        staging_addr = self.allocator.address(lease)
         response_preparation_finished_at = time.perf_counter()
         logger.info(
             "P handle_prepare timing: transfer=%s chunk=%d outcome=ready "
@@ -251,7 +309,7 @@ class PrefillStagingService:
             msg.transfer_id,
             msg.chunk_id,
             (validation_finished_at - validation_started_at) * 1000,
-            (slot_finished_at - slot_started_at) * 1000,
+            (allocation_finished_at - allocation_started_at) * 1000,
             (entry_finished_at - entry_started_at) * 1000,
             (slot_view_finished_at - slot_view_started_at) * 1000,
             (pack_finished_at - t_gather) * 1000,
@@ -259,43 +317,49 @@ class PrefillStagingService:
             (response_preparation_finished_at - handler_started_at) * 1000,
         )
         logger.debug(
-            "P gather done: transfer=%s chunk=%d slot=%d addr=0x%x bytes=%d gather_ms=%.2f",
+            "P gather done: transfer=%s chunk=%d lease=%d addr=0x%x bytes=%d gather_ms=%.2f",
             msg.transfer_id,
             msg.chunk_id,
-            slot.slot_id,
-            slot_addr,
+            lease.lease_id,
+            staging_addr,
             msg.total_bytes,
             gather_ms,
         )
         return PackReadyMsg(
             transfer_id=msg.transfer_id,
             chunk_id=msg.chunk_id,
-            slot_addr=slot_addr,
+            lease_id=lease.lease_id,
+            staging_addr=staging_addr,
             payload_bytes=msg.total_bytes,
             gather_ms=gather_ms,
         )
 
     def handle_read_ack(self, msg: ReadAckMsg) -> bool:
-        """Release the staging slot after D confirms RDMA + scatter done.
+        """Release the staging slot after D confirms the RDMA read is done.
 
         Returns True if the slot was found and released, False if the
         transfer_id/chunk_id was unknown (idempotent).
         """
         key = (msg.transfer_id, msg.chunk_id)
-        with self._active_slots_lock:
-            active = self._active_slots.get(key)
+        with self._active_leases_lock:
+            active = self._active_leases.get(key)
+            if active is not None and active.lease.lease_id != msg.lease_id:
+                return False
         if active is not None:
             active.ready.wait()
-        with self._active_slots_lock:
-            active = self._active_slots.pop(key, None)
+        with self._active_leases_lock:
+            active = self._active_leases.get(key)
+            if active is not None and active.lease.lease_id != msg.lease_id:
+                return False
+            active = self._active_leases.pop(key, None)
         if active is None:
             return False
-        self.pool.release(active.slot_id)
+        self.allocator.release(active.lease)
         logger.debug(
-            "P slot released: transfer=%s chunk=%d slot=%d success=%s",
+            "P staging extent released: transfer=%s chunk=%d lease=%d success=%s",
             msg.transfer_id,
             msg.chunk_id,
-            active.slot_id,
+            active.lease.lease_id,
             msg.success,
         )
         return True
@@ -315,6 +379,8 @@ class PrefillStagingService:
                     chunk_id=item.chunk_id,
                     gather_entries=item.gather_entries,
                     total_bytes=item.total_bytes,
+                    release_source_when_ready=msg.release_source_when_ready,
+                    expected_chunks=msg.expected_chunks,
                 )
             )
             if isinstance(response, StagingErrorMsg):
@@ -331,7 +397,8 @@ class PrefillStagingService:
                     PackReadyBatchItem(
                         chunk_id=item.chunk_id,
                         success=True,
-                        slot_addr=response.slot_addr,
+                        lease_id=response.lease_id,
+                        staging_addr=response.staging_addr,
                         payload_bytes=response.payload_bytes,
                         gather_ms=response.gather_ms,
                     )
@@ -339,9 +406,9 @@ class PrefillStagingService:
         return PackReadyBatchMsg(transfer_id=msg.transfer_id, results=results)
 
     @property
-    def active_slot_count(self) -> int:
-        with self._active_slots_lock:
-            return len(self._active_slots)
+    def active_lease_count(self) -> int:
+        with self._active_leases_lock:
+            return len(self._active_leases)
 
 
 __all__ = [

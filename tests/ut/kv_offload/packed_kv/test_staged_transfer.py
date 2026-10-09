@@ -20,6 +20,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.adapter import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.copy import (
     execute_plan_on_tensors,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv import d_coordinator as d_coordinator_mod
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.d_coordinator import (
     DecodeStagingCoordinator,
 )
@@ -29,7 +30,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.p_service import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
     TransferPlanner,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
+from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
     PackReadyBatchMsg,
     PackReadyMsg,
@@ -42,14 +43,14 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
 )
 
 
-def _make_rdma_read_fn(p_pool: StagingPool, d_pool: StagingPool):
+def _make_rdma_read_fn(p_pool: StagingAllocator, d_pool: StagingAllocator):
     """Create a simulated RDMA read that copies between staging pools.
 
     In production, this is ``batch_transfer_sync_read(D_slot, P_slot, size)``
     over HCCS+RoCE.  Here we simulate it with a tensor memcpy.
     """
-    p_buf = p_pool._pool_view
-    d_buf = d_pool._pool_view
+    p_buf = p_pool.arena_view
+    d_buf = d_pool.arena_view
     p_base = p_pool.base_ptr
     d_base = d_pool.base_ptr
 
@@ -104,19 +105,21 @@ class _Fixture:
         self.p_base = self.p_kv.data_ptr()
         self.d_base = self.d_kv.data_ptr()
 
-        self.p_pool = StagingPool(num_slots=num_slots, slot_capacity=slot_capacity, alignment=64, device="cpu")
-        self.d_pool = StagingPool(num_slots=num_slots, slot_capacity=slot_capacity, alignment=64, device="cpu")
+        self.p_pool = StagingAllocator(capacity_bytes=num_slots * slot_capacity, page_size=64, alignment=64, device="cpu")
+        self.d_pool = StagingAllocator(capacity_bytes=num_slots * slot_capacity, page_size=64, alignment=64, device="cpu")
 
         self.p_service = PrefillStagingService(
-            pool=self.p_pool,
+            allocator=self.p_pool,
             kv_tensor=self.p_kv,
             kv_base_addr=self.p_base,
         )
 
         self.d_coordinator = DecodeStagingCoordinator(
-            pool=self.d_pool,
+            allocator=self.d_pool,
             dst_tensor=self.d_kv,
             dst_base_addr=self.d_base,
+            chunk_capacity=chunk_capacity,
+            max_concurrent_chunks=num_slots,
         )
 
         self.rdma_read = _make_rdma_read_fn(self.p_pool, self.d_pool)
@@ -233,7 +236,7 @@ class TestStagedTransfer:
         def send_ack_batch(msg: ReadAckBatchMsg) -> None:
             for item in msg.results:
                 assert f.p_service.handle_read_ack(
-                    ReadAckMsg(transfer_id=msg.transfer_id, chunk_id=item.chunk_id, success=item.success)
+                    ReadAckMsg(transfer_id=msg.transfer_id, chunk_id=item.chunk_id, lease_id=item.lease_id, success=item.success)
                 )
 
         result = f.d_coordinator.execute(
@@ -246,12 +249,13 @@ class TestStagedTransfer:
             prepare_read_batch=f.p_service.handle_prepare_read_batch,
             send_ack_batch=send_ack_batch,
             rdma_read_batch=rdma_read_batch,
+            batch_window_size=f.d_coordinator.max_concurrent_chunks,
         )
 
         assert result.success
         assert result.chunks_completed == len(plan.packed_chunks)
         assert rdma_batch_calls == [2] * ((len(plan.packed_chunks) + 1) // 2)
-        assert f.p_service.active_slot_count == 0
+        assert f.p_service.active_lease_count == 0
         for s_addr, d_addr, length in zip(src_list, dst_list, length_list):
             s_rel = s_addr - f.p_base
             d_rel = d_addr - f.d_base
@@ -369,7 +373,7 @@ class TestStagedTransfer:
         def merged_rdma_read(d_addrs: list[int], p_addrs: list[int], lengths: list[int]) -> int:
             merged_calls.append((d_addrs, p_addrs, lengths))
             d_pool_start = f.d_pool.base_ptr
-            d_pool_end = d_pool_start + f.d_pool.num_slots * f.d_pool.slot_capacity
+            d_pool_end = d_pool_start + f.d_pool.capacity_bytes
             for d_addr, p_addr, nbytes in zip(d_addrs, p_addrs, lengths):
                 if d_pool_start <= d_addr < d_pool_end:
                     assert f.rdma_read(d_addr, p_addr, nbytes) == 0
@@ -380,7 +384,7 @@ class TestStagedTransfer:
         def send_ack_batch(msg: ReadAckBatchMsg) -> None:
             for item in msg.results:
                 f.p_service.handle_read_ack(
-                    ReadAckMsg(transfer_id=msg.transfer_id, chunk_id=item.chunk_id, success=item.success)
+                    ReadAckMsg(transfer_id=msg.transfer_id, chunk_id=item.chunk_id, lease_id=item.lease_id, success=item.success)
                 )
 
         result = f.d_coordinator.execute(
@@ -400,7 +404,7 @@ class TestStagedTransfer:
         assert result.packed_entries == sum(len(chunk.scatter_entries) for chunk in plan.packed_chunks)
         assert len(merged_calls) == 1
         assert len(merged_calls[0][2]) == len(plan.direct_runs) + len(plan.packed_chunks)
-        assert f.p_service.active_slot_count == 0
+        assert f.p_service.active_lease_count == 0
         for s_addr, d_addr, length in zip(src_list, dst_list, length_list):
             s_rel = s_addr - f.p_base
             d_rel = d_addr - f.d_base
@@ -427,7 +431,7 @@ class TestStagedTransfer:
         )
 
         assert result.success
-        assert f.p_service.active_slot_count == 0
+        assert f.p_service.active_lease_count == 0
         assert len(f.ack_log) == len(plan.packed_chunks)
 
 
@@ -461,7 +465,7 @@ class TestStagedEquivalence:
         spans_ref = spans_from_flat_entries(src_list, ref_dst_list, length_list, request_id="r0")
         planner = TransferPlanner(min_direct_size=2048, chunk_capacity=8192)
         plan_ref = planner.plan(spans_ref, peer_session="p0")
-        ref_pool = StagingPool(num_slots=4, slot_capacity=8192, alignment=64, device="cpu")
+        ref_pool = StagingAllocator(capacity_bytes=4 * 8192, page_size=64, alignment=64, device="cpu")
         execute_plan_on_tensors(plan_ref, p_kv, p_kv.data_ptr(), ref_dst, ref_base, ref_pool)
 
         # --- Staged: P+D with simulated RDMA ---
@@ -472,11 +476,11 @@ class TestStagedEquivalence:
         spans_stg = spans_from_flat_entries(src_list, stg_dst_list, length_list, request_id="r0")
         plan_stg = planner.plan(spans_stg, peer_session="p0")
 
-        p_pool = StagingPool(num_slots=4, slot_capacity=8192, alignment=64, device="cpu")
-        d_pool = StagingPool(num_slots=4, slot_capacity=8192, alignment=64, device="cpu")
+        p_pool = StagingAllocator(capacity_bytes=4 * 8192, page_size=64, alignment=64, device="cpu")
+        d_pool = StagingAllocator(capacity_bytes=4 * 8192, page_size=64, alignment=64, device="cpu")
 
-        p_svc = PrefillStagingService(pool=p_pool, kv_tensor=p_kv, kv_base_addr=p_kv.data_ptr())
-        d_coord = DecodeStagingCoordinator(pool=d_pool, dst_tensor=stg_dst, dst_base_addr=stg_base)
+        p_svc = PrefillStagingService(allocator=p_pool, kv_tensor=p_kv, kv_base_addr=p_kv.data_ptr())
+        d_coord = DecodeStagingCoordinator(allocator=d_pool, dst_tensor=stg_dst, dst_base_addr=stg_base)
         rdma_fn = _make_rdma_read_fn(p_pool, d_pool)
         direct_fn = _make_direct_transfer_fn(p_kv, p_kv.data_ptr(), stg_dst, stg_base)
 
@@ -499,18 +503,18 @@ class TestStagedEquivalence:
 
 
 class TestFailureHandling:
-    def test_p_slot_exhausted(self) -> None:
-        """P has no slots → coordinator returns error, no false success."""
+    def test_p_slot_exhausted_falls_back_to_direct(self) -> None:
+        """P arena miss does not fail the transfer; remaining bytes go direct."""
         f = _Fixture(num_slots=1)
-        f.p_pool.acquire()
+        f.p_pool.allocate(8192)
 
         src_list = [f.p_base]
         dst_list = [f.d_base]
         length_list = [f.block_len]
-
         spans = spans_from_flat_entries(src_list, dst_list, length_list, request_id="r0")
-        planner = TransferPlanner(min_direct_size=f.min_direct_size, chunk_capacity=f.chunk_capacity)
-        plan = planner.plan(spans, peer_session="p0")
+        plan = TransferPlanner(min_direct_size=f.min_direct_size, chunk_capacity=f.chunk_capacity).plan(
+            spans, peer_session="p0"
+        )
 
         result = f.d_coordinator.execute(
             plan,
@@ -521,33 +525,66 @@ class TestFailureHandling:
             send_ack=f.send_ack_fn,
         )
 
-        assert not result.success
-        assert "rejected" in result.error.lower() or "no staging slot" in result.error.lower()
+        assert result.success
+        assert f.p_service.active_lease_count == 0
+        assert f.d_kv[: f.block_len].tolist() == f.p_kv[: f.block_len].tolist()
 
-    def test_d_slot_exhausted(self) -> None:
-        """D has no slots → coordinator returns error."""
+    def test_d_slot_exhausted_falls_back_to_direct(self) -> None:
+        """D arena miss falls back before PREPARE and still copies the bytes."""
         f = _Fixture(num_slots=1)
-        f.d_pool.acquire()
+        f.d_pool.allocate(8192)
+        prepares = {"n": 0}
+
+        def prepare(msg: PrepareReadMsg):
+            prepares["n"] += 1
+            return f.prepare_read_fn(msg)
 
         src_list = [f.p_base]
         dst_list = [f.d_base]
         length_list = [f.block_len]
-
         spans = spans_from_flat_entries(src_list, dst_list, length_list, request_id="r0")
-        planner = TransferPlanner(min_direct_size=f.min_direct_size, chunk_capacity=f.chunk_capacity)
-        plan = planner.plan(spans, peer_session="p0")
+        plan = TransferPlanner(min_direct_size=f.min_direct_size, chunk_capacity=f.chunk_capacity).plan(
+            spans, peer_session="p0"
+        )
 
         result = f.d_coordinator.execute(
             plan,
             transfer_id="tx-fail-d",
             direct_transfer=f.direct_transfer,
-            prepare_read=f.prepare_read_fn,
+            prepare_read=prepare,
             rdma_read=f.rdma_read,
             send_ack=f.send_ack_fn,
         )
 
+        assert result.success
+        assert prepares["n"] == 0
+        assert f.d_kv[: f.block_len].tolist() == f.p_kv[: f.block_len].tolist()
+
+    def test_non_arena_prepare_error_still_fails(self) -> None:
+        """A prepare error other than arena exhaustion still fails the transfer."""
+        f = _Fixture()
+
+        def prepare(msg: PrepareReadMsg) -> StagingErrorMsg:
+            return StagingErrorMsg(msg.transfer_id, msg.chunk_id, 3, "source range invalid")
+
+        src_list = [f.p_base]
+        dst_list = [f.d_base]
+        length_list = [f.block_len]
+        spans = spans_from_flat_entries(src_list, dst_list, length_list, request_id="r0")
+        plan = TransferPlanner(min_direct_size=f.min_direct_size, chunk_capacity=f.chunk_capacity).plan(
+            spans, peer_session="p0"
+        )
+        result = f.d_coordinator.execute(
+            plan,
+            transfer_id="tx-bad-prepare",
+            direct_transfer=f.direct_transfer,
+            prepare_read=prepare,
+            rdma_read=f.rdma_read,
+            send_ack=f.send_ack_fn,
+        )
         assert not result.success
-        assert "no D staging slot" in result.error
+        assert "source range invalid" in result.error
+        assert f.d_kv[0] == f.sentinel
 
     def test_rdma_failure(self) -> None:
         """RDMA read returns non-zero → coordinator reports failure."""
@@ -574,9 +611,93 @@ class TestFailureHandling:
 
         assert not result.success
         assert "RDMA" in result.error
+
+    def test_ack_releases_p_lease_before_scatter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """P staging lease is gone before D scatter starts."""
+        f = _Fixture()
+        src_list = [f.p_base + 1 * f.block_len]
+        dst_list = [f.d_base + 2 * f.block_len]
+        length_list = [f.block_len]
+        spans = spans_from_flat_entries(src_list, dst_list, length_list, request_id="r-ack")
+        plan = TransferPlanner(min_direct_size=f.min_direct_size, chunk_capacity=f.chunk_capacity).plan(
+            spans, peer_session="p0"
+        )
+        real_unpack = d_coordinator_mod.unpack_from_staging
+
+        def unpack_and_check(*args, **kwargs):
+            assert f.p_service.active_lease_count == 0
+            assert f.ack_log and f.ack_log[-1].success
+            return real_unpack(*args, **kwargs)
+
+        monkeypatch.setattr(d_coordinator_mod, "unpack_from_staging", unpack_and_check)
+        result = f.d_coordinator.execute(
+            plan,
+            transfer_id="tx-ack-before-scatter",
+            direct_transfer=f.direct_transfer,
+            prepare_read=f.prepare_read_fn,
+            rdma_read=f.rdma_read,
+            send_ack=f.send_ack_fn,
+        )
+        assert result.success
+        assert f.p_service.active_lease_count == 0
+        d_rel = dst_list[0] - f.d_base
+        s_rel = src_list[0] - f.p_base
+        assert f.d_kv[d_rel : d_rel + f.block_len].tolist() == f.p_kv[s_rel : s_rel + f.block_len].tolist()
+
+    def test_batch_ack_releases_p_leases_before_scatter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A batch window releases every P lease before the batch scatter."""
+        f = _Fixture(num_slots=2, slot_capacity=2048, chunk_capacity=2048)
+        n = 8
+        src_list = [f.p_base + i * f.block_len for i in range(n)]
+        dst_list = [f.d_base + (i + 8) * f.block_len for i in range(n)]
+        length_list = [f.block_len] * n
+        spans = spans_from_flat_entries(src_list, dst_list, length_list, request_id="r-batch-ack")
+        plan = TransferPlanner(min_direct_size=f.min_direct_size, chunk_capacity=f.chunk_capacity).plan(
+            spans, peer_session="p0"
+        )
+        assert len(plan.packed_chunks) > 1
+        real_unpack = d_coordinator_mod.unpack_from_staging_multi_batch
+        seen = {"calls": 0}
+
+        def unpack_and_check(*args, **kwargs):
+            seen["calls"] += 1
+            assert f.p_service.active_lease_count == 0
+            return real_unpack(*args, **kwargs)
+
+        def send_ack_batch(msg: ReadAckBatchMsg) -> None:
+            for item in msg.results:
+                f.send_ack_fn(
+                    ReadAckMsg(
+                        transfer_id=msg.transfer_id,
+                        chunk_id=item.chunk_id,
+                        lease_id=item.lease_id,
+                        success=item.success,
+                    )
+                )
+
+        monkeypatch.setattr(d_coordinator_mod, "unpack_from_staging_multi_batch", unpack_and_check)
+        result = f.d_coordinator.execute(
+            plan,
+            transfer_id="tx-batch-ack-before-scatter",
+            direct_transfer=f.direct_transfer,
+            prepare_read=f.prepare_read_fn,
+            rdma_read=f.rdma_read,
+            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.p_service.handle_prepare_read_batch,
+            send_ack_batch=send_ack_batch,
+            rdma_read_batch=lambda d_addrs, p_addrs, lengths: (
+                0
+                if all(f.rdma_read(d, p, n) == 0 for d, p, n in zip(d_addrs, p_addrs, lengths))
+                else -1
+            ),
+            batch_window_size=f.d_coordinator.max_concurrent_chunks,
+        )
+        assert result.success
+        assert seen["calls"] >= 1
+        assert f.p_service.active_lease_count == 0
         assert len(f.ack_log) == 1
         assert f.ack_log[0].success is False
-        assert f.p_service.active_slot_count == 0
+        assert f.p_service.active_lease_count == 0
 
     def test_direct_transfer_failure(self) -> None:
         """Direct transfer returns non-zero → failure reported."""
@@ -618,6 +739,39 @@ class TestFailureHandling:
 
 
 class TestPrefillService:
+    def test_final_gather_notifies_source_release_once(self) -> None:
+        f = _Fixture(num_slots=2)
+        completed: list[str] = []
+        f.p_service.on_transfer_staged = completed.append
+        common = dict(
+            transfer_id="tx-early-release",
+            gather_entries=[(f.p_base, 0, f.block_len)],
+            total_bytes=f.block_len,
+            release_source_when_ready=True,
+            expected_chunks=2,
+        )
+
+        first = f.p_service.handle_prepare_read(PrepareReadMsg(chunk_id=0, **common))
+        assert isinstance(first, PackReadyMsg)
+        assert completed == []
+        second = f.p_service.handle_prepare_read(PrepareReadMsg(chunk_id=1, **common))
+        assert isinstance(second, PackReadyMsg)
+        assert completed == ["tx-early-release"]
+
+        # A duplicate prepare reuses the lease and must not fire the callback.
+        duplicate = f.p_service.handle_prepare_read(PrepareReadMsg(chunk_id=1, **common))
+        assert isinstance(duplicate, PackReadyMsg)
+        assert completed == ["tx-early-release"]
+
+        for chunk_id, response in ((0, first), (1, second)):
+            assert f.p_service.handle_read_ack(
+                ReadAckMsg(
+                    transfer_id="tx-early-release",
+                    chunk_id=chunk_id,
+                    lease_id=response.lease_id,
+                )
+            )
+
     def test_prepare_read_batch_returns_per_chunk_results(self) -> None:
         f = _Fixture(num_slots=2)
         msg = PrepareReadBatchMsg(
@@ -641,12 +795,12 @@ class TestPrefillService:
         assert isinstance(response, PackReadyBatchMsg)
         assert [item.chunk_id for item in response.results] == [0, 1]
         assert all(item.success for item in response.results)
-        assert f.p_service.active_slot_count == 2
+        assert f.p_service.active_lease_count == 2
         for item in response.results:
             assert f.p_service.handle_read_ack(
-                ReadAckMsg(transfer_id=msg.transfer_id, chunk_id=item.chunk_id)
+                ReadAckMsg(transfer_id=msg.transfer_id, chunk_id=item.chunk_id, lease_id=item.lease_id)
             )
-        assert f.p_service.active_slot_count == 0
+        assert f.p_service.active_lease_count == 0
 
     def test_idempotent_prepare_read(self) -> None:
         """Duplicate PREPARE_READ returns same slot (no double alloc)."""
@@ -663,8 +817,8 @@ class TestPrefillService:
 
         assert isinstance(r1, PackReadyMsg)
         assert isinstance(r2, PackReadyMsg)
-        assert r1.slot_addr == r2.slot_addr
-        assert f.p_service.active_slot_count == 1
+        assert r1.staging_addr == r2.staging_addr
+        assert f.p_service.active_lease_count == 1
 
     def test_read_ack_idempotent(self) -> None:
         """Duplicate READ_ACK is a no-op (returns False)."""
@@ -675,16 +829,15 @@ class TestPrefillService:
             gather_entries=[(f.p_base, 0, f.block_len)],
             total_bytes=f.block_len,
         )
-        f.p_service.handle_prepare_read(msg)
-
-        ack = ReadAckMsg(transfer_id="tx-ack-idem", chunk_id=0)
+        ready = f.p_service.handle_prepare_read(msg)
+        ack = ReadAckMsg(transfer_id="tx-ack-idem", chunk_id=0, lease_id=ready.lease_id)
         assert f.p_service.handle_read_ack(ack) is True
         assert f.p_service.handle_read_ack(ack) is False
 
     def test_unknown_ack(self) -> None:
         """ACK for unknown transfer returns False."""
         f = _Fixture()
-        ack = ReadAckMsg(transfer_id="unknown", chunk_id=99)
+        ack = ReadAckMsg(transfer_id="unknown", chunk_id=99, lease_id=1)
         assert f.p_service.handle_read_ack(ack) is False
 
     def test_prepare_rejects_out_of_range_source(self) -> None:
@@ -700,8 +853,8 @@ class TestPrefillService:
 
         assert isinstance(response, StagingErrorMsg)
         assert "outside" in response.reason
-        assert f.p_service.active_slot_count == 0
-        assert f.p_pool.acquire() is not None
+        assert f.p_service.active_lease_count == 0
+        assert f.p_pool.allocate(8192) is not None
 
     def test_gather_exception_releases_slot(self, monkeypatch) -> None:
         f = _Fixture()
@@ -723,10 +876,10 @@ class TestPrefillService:
         with pytest.raises(RuntimeError, match="gather failed"):
             f.p_service.handle_prepare_read(msg)
 
-        assert f.p_service.active_slot_count == 0
-        slot = f.p_pool.acquire()
-        assert slot is not None
-        f.p_pool.release(slot.slot_id)
+        assert f.p_service.active_lease_count == 0
+        lease = f.p_pool.allocate(8192)
+        assert lease is not None
+        f.p_pool.release(lease)
 
     def test_concurrent_duplicate_prepare_reuses_one_slot(self) -> None:
         f = _Fixture(num_slots=2)
@@ -741,8 +894,8 @@ class TestPrefillService:
             responses = list(executor.map(lambda _: f.p_service.handle_prepare_read(msg), range(2)))
 
         assert all(isinstance(response, PackReadyMsg) for response in responses)
-        assert responses[0].slot_addr == responses[1].slot_addr
-        assert f.p_service.active_slot_count == 1
+        assert responses[0].staging_addr == responses[1].staging_addr
+        assert f.p_service.active_lease_count == 1
 
 
 # =====================================================================
@@ -750,10 +903,10 @@ class TestPrefillService:
 # =====================================================================
 
 
-def _make_rdma_read_fn_multi(p_pool: StagingPool, d_pool: StagingPool):
+def _make_rdma_read_fn_multi(p_pool: StagingAllocator, d_pool: StagingAllocator):
     """Simulated RDMA read between multi-region staging pools."""
-    p_buf = p_pool._pool_view
-    d_buf = d_pool._pool_view
+    p_buf = p_pool.arena_view
+    d_buf = d_pool.arena_view
     p_base = p_pool.base_ptr
     d_base = d_pool.base_ptr
 
@@ -791,21 +944,23 @@ class _MultiRegionFixture:
         self.p_regions = sorted([(t.data_ptr(), t) for t in self.p_tensors], key=lambda r: r[0])
         self.d_regions = sorted([(t.data_ptr(), t) for t in self.d_tensors], key=lambda r: r[0])
 
-        self.p_pool = StagingPool(num_slots=num_slots, slot_capacity=slot_capacity, alignment=64, device="cpu")
-        self.d_pool = StagingPool(num_slots=num_slots, slot_capacity=slot_capacity, alignment=64, device="cpu")
+        self.p_pool = StagingAllocator(capacity_bytes=num_slots * slot_capacity, page_size=64, alignment=64, device="cpu")
+        self.d_pool = StagingAllocator(capacity_bytes=num_slots * slot_capacity, page_size=64, alignment=64, device="cpu")
 
         dummy = torch.empty(0, dtype=torch.int8)
         self.p_service = PrefillStagingService(
-            pool=self.p_pool,
+            allocator=self.p_pool,
             kv_tensor=dummy,
             kv_base_addr=0,
             kv_regions=self.p_regions,
         )
         self.d_coordinator = DecodeStagingCoordinator(
-            pool=self.d_pool,
+            allocator=self.d_pool,
             dst_tensor=dummy,
             dst_base_addr=0,
             dst_regions=self.d_regions,
+            chunk_capacity=chunk_capacity,
+            max_concurrent_chunks=num_slots,
         )
 
         self.rdma_read = _make_rdma_read_fn_multi(self.p_pool, self.d_pool)
@@ -912,4 +1067,4 @@ class TestMultiRegionStagedTransfer:
         )
 
         assert result.success
-        assert f.p_service.active_slot_count == 0
+        assert f.p_service.active_lease_count == 0

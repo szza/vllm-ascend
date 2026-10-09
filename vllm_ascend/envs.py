@@ -118,14 +118,28 @@ env_variables: dict[str, Callable[[], Any]] = {
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     "VLLM_ASCEND_STAGING_ENABLED": lambda: _strict_binary_env("VLLM_ASCEND_STAGING_ENABLED"),
-    "VLLM_ASCEND_STAGING_NUM_SLOTS": lambda: int(os.getenv("VLLM_ASCEND_STAGING_NUM_SLOTS", "2")),
-    "VLLM_ASCEND_STAGING_SLOT_CAPACITY_MIB": lambda: int(
-        os.getenv("VLLM_ASCEND_STAGING_SLOT_CAPACITY_MIB", "16")
+    # Total page-based staging arena capacity per worker, in MiB. Default: 32.
+    "VLLM_ASCEND_STAGING_CAPACITY_MIB": lambda: int(os.getenv("VLLM_ASCEND_STAGING_CAPACITY_MIB", "32")),
+    # Staging allocator page size in KiB. Must be a positive power of two.
+    # Default: 256 KiB; platform alignment requirements may impose a minimum.
+    "VLLM_ASCEND_STAGING_PAGE_SIZE_KIB": lambda: int(os.getenv("VLLM_ASCEND_STAGING_PAGE_SIZE_KIB", "256")),
+    # Maximum packed chunk size in MiB. Default: 16.
+    "VLLM_ASCEND_STAGING_CHUNK_CAPACITY_MIB": lambda: int(
+        os.getenv("VLLM_ASCEND_STAGING_CHUNK_CAPACITY_MIB", "16")
+    ),
+    # Maximum number of chunks prepared in one staging window. Default: 2.
+    "VLLM_ASCEND_STAGING_MAX_CONCURRENT_CHUNKS": lambda: int(
+        os.getenv("VLLM_ASCEND_STAGING_MAX_CONCURRENT_CHUNKS", "2")
     ),
     # Entry size threshold in bytes for bypassing staging and using direct RDMA.
     # Entries smaller than this value are packed into staging slots.
     "VLLM_ASCEND_STAGING_MIN_DIRECT_SIZE": lambda: int(
         os.getenv("VLLM_ASCEND_STAGING_MIN_DIRECT_SIZE", str(1 * 1024 * 1024))
+    ),
+    # Maximum prompt length for staging in MooncakeConnectorV1. A prompt at
+    # or above this value uses direct RDMA; 0 disables the cutoff. Default: 8192.
+    "VLLM_ASCEND_STAGING_V1_MAX_PROMPT_TOKENS": lambda: int(
+        os.getenv("VLLM_ASCEND_STAGING_V1_MAX_PROMPT_TOKENS", "8192")
     ),
 }
 

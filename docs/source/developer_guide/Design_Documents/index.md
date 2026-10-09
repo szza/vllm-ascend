@@ -9,6 +9,10 @@ patch
 cpu_binding
 ModelRunner_prepare_inputs
 disaggregated_prefill
+pd_mooncake_prefill_architecture
+mooncake_staging_optimization
+mooncake_staging_allocator
+mooncake_staging_datapath_optimizations
 eplb_swift_balancer
 ACL_Graph
 KV_Cache_Pool_Guide

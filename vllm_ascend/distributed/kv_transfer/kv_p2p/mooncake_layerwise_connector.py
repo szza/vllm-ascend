@@ -584,7 +584,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             request_id=first_req_id,
             peer_session=session_id,
             min_direct_size=self.staging_min_direct_size,
-            chunk_capacity=self.staging_coordinator.pool.slot_capacity,
+            chunk_capacity=self.staging_coordinator.chunk_capacity,
         )
 
         logger.info(
@@ -807,8 +807,10 @@ class KVCacheRecvingLayerThread(threading.Thread):
                 )
                 response = self.write_service.handle_prepare_write(msg)
                 logger.info(
-                    "D-side WRITE_READY: transfer_id=%s, slot_addr=0x%x",
-                    msg.transfer_id, response.slot_addr if hasattr(response, 'slot_addr') else 0,
+                    "D-side WRITE_READY: transfer_id=%s, lease_id=%s, staging_addr=0x%x",
+                    msg.transfer_id,
+                    response.lease_id if hasattr(response, "lease_id") else 0,
+                    response.staging_addr if hasattr(response, "staging_addr") else 0,
                 )
                 sock.send_multipart((identity, b"", encode_msg(response)))
             elif msg_type == StagingMsgType.WRITE_DONE:
@@ -1599,9 +1601,7 @@ class MooncakeLayerwiseConnectorWorker:
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.p_write_coordinator import (
             PrefillWriteCoordinator,
         )
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import (
-            StagingPool,
-        )
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator
 
         kv_regions: list[tuple[int, torch.Tensor]] = []
         seen_ptrs: set[int] = set()
@@ -1623,15 +1623,15 @@ class MooncakeLayerwiseConnectorWorker:
         dummy_tensor = kv_regions[0][1]
         dummy_addr = kv_regions[0][0]
 
-        pool = StagingPool(
-            num_slots=config.num_slots,
-            slot_capacity=config.slot_capacity,
+        allocator = StagingAllocator(
+            capacity_bytes=config.arena_capacity,
+            page_size=config.page_size,
         )
-        pool.register(self.engine)
+        allocator.register(self.engine)
         logger.info(
-            "Staging pool created: slots=%d, capacity=%d MiB",
-            config.num_slots,
-            config.slot_capacity // (1024 * 1024),
+            "Staging arena created: capacity=%d MiB page=%d KiB",
+            config.arena_capacity // (1024 * 1024),
+            config.page_size // 1024,
         )
 
         coordinator = None
@@ -1639,16 +1639,17 @@ class MooncakeLayerwiseConnectorWorker:
 
         if self.vllm_config.kv_transfer_config.is_kv_producer:
             coordinator = PrefillWriteCoordinator(
-                pool=pool,
+                allocator=allocator,
                 src_tensor=dummy_tensor,
                 src_base_addr=dummy_addr,
                 src_regions=kv_regions,
+                chunk_capacity=config.chunk_capacity,
             )
             logger.info("PrefillWriteCoordinator created for staging WRITE mode")
 
         if self.vllm_config.kv_transfer_config.is_kv_consumer:
             write_service = DecodeWriteService(
-                pool=pool,
+                allocator=allocator,
                 kv_tensor=dummy_tensor,
                 kv_base_addr=dummy_addr,
                 kv_regions=kv_regions,

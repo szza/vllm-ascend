@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
-"""Gather/scatter copy backend for staging pool.
+"""Gather/scatter copy backend for staging extents.
 
 Provides two paths:
 - **Batch DMA** (NPU): packs all entries into three descriptor tensors and
@@ -24,7 +24,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
     ScatterEntry,
     TransferPlan,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
+from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator
 
 DIRECTION_D2D = 2
 
@@ -421,13 +421,13 @@ def execute_plan_on_tensors(
     src_base_addr: int,
     dst: torch.Tensor,
     dst_base_addr: int,
-    staging_pool: StagingPool,
+    allocator: StagingAllocator,
 ) -> None:
     """Execute a full TransferPlan using tensor copies on a single device.
 
     Direct runs copy straight from src to dst.  Packed chunks go through
-    the staging pool: acquire slot -> gather -> (future: RDMA) -> scatter
-    -> release slot.  Used for single-device byte-consistency testing.
+    the staging allocator: allocate extent -> gather -> scatter -> release.
+    Used for single-device byte-consistency testing.
     """
     use_dma = _check_batch_dma() and getattr(src, "is_npu", False)
 
@@ -448,22 +448,22 @@ def execute_plan_on_tensors(
                 dst_flat[d_rel : d_rel + dr.nbytes].copy_(src_flat[s_rel : s_rel + dr.nbytes])
 
     for chunk in plan.packed_chunks:
-        slot = staging_pool.acquire()
-        if slot is None:
-            raise RuntimeError("No staging slot available")
-
-        staging_view = staging_pool.slot_view(slot.slot_id)
-        pack_into_staging(src, src_base_addr, staging_view, chunk.gather_entries)
-        unpack_from_staging(staging_view, dst, dst_base_addr, chunk.scatter_entries)
-
-        staging_pool.release(slot.slot_id)
+        lease = allocator.allocate(chunk.payload_bytes)
+        if lease is None:
+            raise RuntimeError("No staging extent available")
+        try:
+            staging_view = allocator.view(lease)
+            pack_into_staging(src, src_base_addr, staging_view, chunk.gather_entries)
+            unpack_from_staging(staging_view, dst, dst_base_addr, chunk.scatter_entries)
+        finally:
+            allocator.release(lease)
 
 
 def execute_plan_on_tensors_multi(
     plan: TransferPlan,
     src_regions: Sequence[tuple[int, torch.Tensor]],
     dst_regions: Sequence[tuple[int, torch.Tensor]],
-    staging_pool: StagingPool,
+    allocator: StagingAllocator,
 ) -> None:
     """Execute a full TransferPlan across multiple source/destination tensors.
 
@@ -496,15 +496,15 @@ def execute_plan_on_tensors_multi(
                 d_tensor.view(-1)[d_rel : d_rel + dr.nbytes].copy_(s_tensor.view(-1)[s_rel : s_rel + dr.nbytes])
 
     for chunk in plan.packed_chunks:
-        slot = staging_pool.acquire()
-        if slot is None:
-            raise RuntimeError("No staging slot available")
-
-        staging_view = staging_pool.slot_view(slot.slot_id)
-        pack_into_staging_multi(src_regions, staging_view, chunk.gather_entries)
-        unpack_from_staging_multi(staging_view, dst_regions, chunk.scatter_entries)
-
-        staging_pool.release(slot.slot_id)
+        lease = allocator.allocate(chunk.payload_bytes)
+        if lease is None:
+            raise RuntimeError("No staging extent available")
+        try:
+            staging_view = allocator.view(lease)
+            pack_into_staging_multi(src_regions, staging_view, chunk.gather_entries)
+            unpack_from_staging_multi(staging_view, dst_regions, chunk.scatter_entries)
+        finally:
+            allocator.release(lease)
 
 
 __all__ = [

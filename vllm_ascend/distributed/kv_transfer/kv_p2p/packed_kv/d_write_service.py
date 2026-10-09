@@ -25,7 +25,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.copy import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
     ScatterEntry,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
+from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator, StagingLease
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
     PrepareWriteMsg,
     StagingErrorMsg,
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _PendingSlot:
-    slot_id: int
+    lease: StagingLease
     transfer_id: str
     chunk_id: int
     scatter_entries: list[ScatterEntry]
@@ -50,8 +50,8 @@ class DecodeWriteService:
 
     Parameters
     ----------
-    pool : StagingPool
-        D-side staging pool (HBM buffer registered with TE).
+    allocator : StagingAllocator
+        D-side staging arena registered with TE.
     kv_tensor : torch.Tensor
         Flat view of the D-side KV cache.
     kv_base_addr : int
@@ -60,7 +60,7 @@ class DecodeWriteService:
         Multi-region KV cache: sorted list of (base_addr, flat_tensor).
     """
 
-    pool: StagingPool
+    allocator: StagingAllocator
     kv_tensor: torch.Tensor
     kv_base_addr: int
     kv_regions: list[tuple[int, torch.Tensor]] = field(default_factory=list, init=True)
@@ -68,7 +68,7 @@ class DecodeWriteService:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def handle_prepare_write(self, msg: PrepareWriteMsg) -> WriteReadyMsg | StagingErrorMsg:
-        """Allocate a staging slot for an incoming RDMA WRITE.
+        """Allocate a staging extent for an incoming RDMA WRITE.
 
         Returns ``WriteReadyMsg`` on success, ``StagingErrorMsg`` if no
         slot is available or validation fails.
@@ -90,17 +90,18 @@ class DecodeWriteService:
                 return WriteReadyMsg(
                     transfer_id=msg.transfer_id,
                     chunk_id=msg.chunk_id,
-                    slot_addr=self.pool.slot_ptr(existing.slot_id),
+                    lease_id=existing.lease.lease_id,
+                    staging_addr=self.allocator.address(existing.lease),
                     payload_bytes=msg.total_bytes,
                 )
 
-            slot = self.pool.acquire()
-            if slot is None:
+            lease = self.allocator.allocate(msg.total_bytes)
+            if lease is None:
                 return StagingErrorMsg(
                     transfer_id=msg.transfer_id,
                     chunk_id=msg.chunk_id,
                     code=1,
-                    reason="no staging slot available",
+                    reason="staging arena has no contiguous extent available",
                 )
 
             scatter_entries = [
@@ -108,25 +109,26 @@ class DecodeWriteService:
                 for dst, off, n in msg.scatter_entries
             ]
             self._pending[key] = _PendingSlot(
-                slot_id=slot.slot_id,
+                lease=lease,
                 transfer_id=msg.transfer_id,
                 chunk_id=msg.chunk_id,
                 scatter_entries=scatter_entries,
             )
 
-        slot_addr = self.pool.slot_ptr(slot.slot_id)
+        staging_addr = self.allocator.address(lease)
         logger.debug(
-            "D slot allocated: transfer=%s chunk=%d slot=%d addr=0x%x bytes=%d",
+            "D staging extent allocated: transfer=%s chunk=%d lease=%d addr=0x%x bytes=%d",
             msg.transfer_id,
             msg.chunk_id,
-            slot.slot_id,
-            slot_addr,
+            lease.lease_id,
+            staging_addr,
             msg.total_bytes,
         )
         return WriteReadyMsg(
             transfer_id=msg.transfer_id,
             chunk_id=msg.chunk_id,
-            slot_addr=slot_addr,
+            lease_id=lease.lease_id,
+            staging_addr=staging_addr,
             payload_bytes=msg.total_bytes,
         )
 
@@ -138,12 +140,15 @@ class DecodeWriteService:
         """
         key = (msg.transfer_id, msg.chunk_id)
         with self._lock:
+            pending = self._pending.get(key)
+            if pending is not None and pending.lease.lease_id != msg.lease_id:
+                return False
             pending = self._pending.pop(key, None)
         if pending is None:
             return False
 
         if msg.success:
-            staging_view = self.pool.slot_view(pending.slot_id)
+            staging_view = self.allocator.view(pending.lease)
             try:
                 if self.kv_regions:
                     unpack_from_staging_multi(
@@ -159,15 +164,15 @@ class DecodeWriteService:
                         pending.scatter_entries,
                     )
             except Exception:
-                self.pool.release(pending.slot_id)
+                self.allocator.release(pending.lease)
                 raise
 
-        self.pool.release(pending.slot_id)
+        self.allocator.release(pending.lease)
         logger.debug(
-            "D scatter done: transfer=%s chunk=%d slot=%d success=%s",
+            "D scatter done: transfer=%s chunk=%d lease=%d success=%s",
             msg.transfer_id,
             msg.chunk_id,
-            pending.slot_id,
+            pending.lease.lease_id,
             msg.success,
         )
         return True
@@ -175,11 +180,8 @@ class DecodeWriteService:
     def _validate(self, msg: PrepareWriteMsg) -> str | None:
         if msg.total_bytes <= 0:
             return "payload must be positive"
-        if msg.total_bytes > self.pool.slot_capacity:
-            return (
-                f"payload exceeds staging slot capacity: payload={msg.total_bytes}, "
-                f"capacity={self.pool.slot_capacity}"
-            )
+        if msg.total_bytes > self.allocator.capacity_bytes:
+            return f"payload exceeds staging arena capacity: payload={msg.total_bytes}, capacity={self.allocator.capacity_bytes}"
 
         regions = self.kv_regions
         if not regions and self.kv_tensor.numel() > 0:

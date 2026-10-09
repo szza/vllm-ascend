@@ -6,13 +6,13 @@ Defines the message types exchanged between coordinator and service
 for the packed KV transfer protocol.
 
 READ mode (v1 connector — D initiates):
-  D → P: ``PrepareReadMsg``  — request P to gather into staging slot
-  P → D: ``PackReadyMsg``    — gather done, slot address returned
-  D → P: ``ReadAckMsg``      — RDMA complete, P may release slot
+  D → P: ``PrepareReadMsg``  — request P to gather into a staging extent
+  P → D: ``PackReadyMsg``    — gather done, extent address and lease returned
+  D → P: ``ReadAckMsg``      — RDMA complete, P may release the lease
 
 WRITE mode (layerwise connector — P initiates):
-  P → D: ``PrepareWriteMsg`` — request D to allocate staging slot
-  D → P: ``WriteReadyMsg``   — slot allocated, address returned
+  P → D: ``PrepareWriteMsg`` — request D to allocate a staging extent
+  D → P: ``WriteReadyMsg``   — extent allocated, address and lease returned
   P → D: ``WriteDoneMsg``    — RDMA WRITE complete, D may scatter + release
 
 Serialization uses ``msgspec`` (consistent with the existing connector).
@@ -41,7 +41,7 @@ class StagingMsgType(enum.IntEnum):
 
 
 class PrepareReadMsg(msgspec.Struct, array_like=True):
-    """D → P: request gather into a P-side staging slot.
+    """D → P: request gather into a P-side staging extent.
 
     ``gather_entries`` is a list of (src_offset, packed_offset, nbytes)
     tuples describing which source KV regions to pack.
@@ -51,23 +51,27 @@ class PrepareReadMsg(msgspec.Struct, array_like=True):
     chunk_id: int
     gather_entries: list[tuple[int, int, int]]
     total_bytes: int
+    release_source_when_ready: bool = False
+    expected_chunks: int = 0
 
 
 class PackReadyMsg(msgspec.Struct, array_like=True):
-    """P → D: gather complete, staging slot exposed for RDMA read."""
+    """P -> D: gather complete, staging extent exposed for RDMA read."""
 
     transfer_id: str
     chunk_id: int
-    slot_addr: int
+    lease_id: int
+    staging_addr: int
     payload_bytes: int
     gather_ms: float = 0.0
 
 
 class ReadAckMsg(msgspec.Struct, array_like=True):
-    """D → P: chunk finished or aborted, P may release its slot."""
+    """D -> P: chunk finished or aborted, P may release its lease."""
 
     transfer_id: str
     chunk_id: int
+    lease_id: int
     success: bool = True
 
 
@@ -84,6 +88,8 @@ class PrepareReadBatchMsg(msgspec.Struct, array_like=True):
 
     transfer_id: str
     chunks: list[PrepareReadBatchItem]
+    release_source_when_ready: bool = False
+    expected_chunks: int = 0
 
 
 class PackReadyBatchItem(msgspec.Struct, array_like=True):
@@ -91,7 +97,8 @@ class PackReadyBatchItem(msgspec.Struct, array_like=True):
 
     chunk_id: int
     success: bool
-    slot_addr: int = 0
+    lease_id: int = 0
+    staging_addr: int = 0
     payload_bytes: int = 0
     gather_ms: float = 0.0
     error_code: int = 0
@@ -109,11 +116,12 @@ class ReadAckBatchItem(msgspec.Struct, array_like=True):
     """Completion status for one chunk in a batched READ ack."""
 
     chunk_id: int
+    lease_id: int
     success: bool = True
 
 
 class ReadAckBatchMsg(msgspec.Struct, array_like=True):
-    """D -> P: release multiple READ staging slots."""
+    """D -> P: release multiple READ staging leases."""
 
     transfer_id: str
     results: list[ReadAckBatchItem]
@@ -124,8 +132,13 @@ class StagingCapabilityMsg(msgspec.Struct, array_like=True):
 
     supported: bool
     max_chunk_bytes: int = 0
-    num_slots: int = 0
-    protocol_version: int = 1
+    arena_capacity_bytes: int = 0
+    page_size: int = 0
+    protocol_version: int = 2
+
+
+# No contiguous staging extent. Callers may fall back to direct RDMA.
+STAGING_ERR_ARENA_EXHAUSTED = 1
 
 
 class StagingErrorMsg(msgspec.Struct, array_like=True):
@@ -138,7 +151,7 @@ class StagingErrorMsg(msgspec.Struct, array_like=True):
 
 
 class PrepareWriteMsg(msgspec.Struct, array_like=True):
-    """P → D: request D to allocate a staging slot for RDMA WRITE.
+    """P -> D: request D to allocate a staging extent for RDMA WRITE.
 
     ``scatter_entries`` is a list of (dst_offset, packed_offset, nbytes)
     tuples describing where D should scatter data after the WRITE.
@@ -151,19 +164,21 @@ class PrepareWriteMsg(msgspec.Struct, array_like=True):
 
 
 class WriteReadyMsg(msgspec.Struct, array_like=True):
-    """D → P: staging slot allocated, address returned for RDMA WRITE."""
+    """D -> P: staging extent allocated, address returned for RDMA WRITE."""
 
     transfer_id: str
     chunk_id: int
-    slot_addr: int
+    lease_id: int
+    staging_addr: int
     payload_bytes: int
 
 
 class WriteDoneMsg(msgspec.Struct, array_like=True):
-    """P → D: RDMA WRITE complete, D may scatter and release the slot."""
+    """P -> D: RDMA WRITE complete, D may scatter and release the lease."""
 
     transfer_id: str
     chunk_id: int
+    lease_id: int
     success: bool = True
 
 

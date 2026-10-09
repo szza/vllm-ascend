@@ -35,7 +35,7 @@ for pkg in pkg_tree:
 
 _packed_kv_pkg = sys.modules["vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv"]
 _base_dir = "vllm_ascend/distributed/kv_transfer/kv_p2p/packed_kv"
-for mod_name in ["planner", "pool", "copy", "budget"]:
+for mod_name in ["planner", "allocator", "copy", "budget"]:
     fqn = f"vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.{mod_name}"
     spec = importlib.util.spec_from_file_location(fqn, os.path.join(_base_dir, f"{mod_name}.py"))
     mod = importlib.util.module_from_spec(spec)
@@ -58,17 +58,24 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
     TransferPlanner,
     spans_from_block_mapping,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
+from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator
 
 DEVICE = "npu:0"
 
 
-def test_pool_npu_allocation():
-    """StagingPool allocates aligned HBM on NPU."""
+def test_allocator_npu_allocation():
+    """StagingAllocator allocates aligned HBM on NPU."""
     alignment = 2 * 1024 * 1024
-    pool = StagingPool(num_slots=2, slot_capacity=1024 * 1024, alignment=alignment, device=DEVICE)
+    pool = StagingAllocator(
+        capacity_bytes=2 * 1024 * 1024,
+        page_size=256 * 1024,
+        alignment=alignment,
+        device=DEVICE,
+    )
     assert pool.base_ptr % alignment == 0
-    v = pool.slot_view(0)
+    lease = pool.allocate(1024 * 1024)
+    assert lease is not None
+    v = pool.view(lease)
     assert v.device.type == "npu"
     v.fill_(42)
     assert v[0].item() == 42
@@ -156,7 +163,7 @@ def test_execute_plan_npu():
 
     planner = TransferPlanner(min_direct_size=1024, chunk_capacity=8192)
     plan = planner.plan(all_spans, peer_session="s0")
-    pool = StagingPool(num_slots=4, slot_capacity=8192, alignment=64, device=DEVICE)
+    pool = StagingAllocator(capacity_bytes=4 * 8192, page_size=64, alignment=64, device=DEVICE)
     execute_plan_on_tensors(plan, src, src_base, dst, dst_base, pool)
 
     torch.npu.synchronize()
@@ -190,7 +197,7 @@ def test_sentinel_preserved_npu():
     ]
     planner = TransferPlanner(min_direct_size=2048, chunk_capacity=16384)
     plan = planner.plan(spans, peer_session="s0")
-    pool = StagingPool(num_slots=2, slot_capacity=16384, alignment=64, device=DEVICE)
+    pool = StagingAllocator(capacity_bytes=2 * 16384, page_size=64, alignment=64, device=DEVICE)
     execute_plan_on_tensors(plan, src, src_base, dst, dst_base, pool)
     torch.npu.synchronize()
 
@@ -208,7 +215,7 @@ if __name__ == "__main__":
     print(f"Using device: {DEVICE}\n")
 
     tests = [
-        test_pool_npu_allocation,
+        test_allocator_npu_allocation,
         test_batch_dma_available,
         test_gather_scatter_npu,
         test_execute_plan_npu,

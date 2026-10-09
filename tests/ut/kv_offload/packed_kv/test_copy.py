@@ -24,7 +24,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
     TransferPlanner,
     spans_from_block_mapping,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
+from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator
 
 # =====================================================================
 # pack_into_staging
@@ -149,7 +149,7 @@ class TestExecutePlan:
             ),
         ]
         plan = planner.plan(spans, peer_session="s0")
-        pool = StagingPool(num_slots=1, slot_capacity=_MIB, alignment=64, device="cpu")
+        pool = StagingAllocator(capacity_bytes=1 * _MIB, page_size=64, alignment=64, device="cpu")
         execute_plan_on_tensors(plan, src, src_base, dst, dst_base, pool)
         assert torch.equal(src, dst)
 
@@ -178,7 +178,7 @@ class TestExecutePlan:
         ]
         plan = planner.plan(spans, peer_session="s0")
         assert len(plan.packed_chunks) > 0
-        pool = StagingPool(num_slots=2, slot_capacity=_MIB, alignment=64, device="cpu")
+        pool = StagingAllocator(capacity_bytes=2 * _MIB, page_size=64, alignment=64, device="cpu")
         execute_plan_on_tensors(plan, src, src_base, dst, dst_base, pool)
         assert torch.equal(src, dst)
 
@@ -225,7 +225,7 @@ class TestExecutePlan:
         plan = planner.plan(spans, peer_session="s0")
         assert len(plan.direct_runs) > 0
         assert len(plan.packed_chunks) > 0
-        pool = StagingPool(num_slots=2, slot_capacity=_MIB, alignment=64, device="cpu")
+        pool = StagingAllocator(capacity_bytes=2 * _MIB, page_size=64, alignment=64, device="cpu")
         execute_plan_on_tensors(plan, src, src_base, dst, dst_base, pool)
         expected = torch.zeros(size, dtype=torch.int8)
         for sp in spans:
@@ -271,7 +271,7 @@ class TestExecutePlan:
 
         planner = TransferPlanner(min_direct_size=1024, chunk_capacity=8192)
         plan = planner.plan(all_spans, peer_session="s0")
-        pool = StagingPool(num_slots=4, slot_capacity=8192, alignment=64, device="cpu")
+        pool = StagingAllocator(capacity_bytes=4 * 8192, page_size=64, alignment=64, device="cpu")
         execute_plan_on_tensors(plan, src, src_base, dst, dst_base, pool)
 
         expected = torch.zeros_like(dst)
@@ -305,7 +305,7 @@ class TestExecutePlan:
         ]
         planner = TransferPlanner(min_direct_size=1024, chunk_capacity=_MIB)
         plan = planner.plan(spans, peer_session="s0")
-        pool = StagingPool(num_slots=2, slot_capacity=_MIB, alignment=64, device="cpu")
+        pool = StagingAllocator(capacity_bytes=2 * _MIB, page_size=64, alignment=64, device="cpu")
         execute_plan_on_tensors(plan, src, src_base, dst, dst_base, pool)
 
         assert dst[100:300].tolist() == src[100:300].tolist()
@@ -431,7 +431,7 @@ class TestExecutePlanMulti:
         plan = planner.plan(spans, peer_session="s0")
         assert len(plan.packed_chunks) > 0
 
-        pool = StagingPool(num_slots=2, slot_capacity=_MIB, alignment=64, device="cpu")
+        pool = StagingAllocator(capacity_bytes=2 * _MIB, page_size=64, alignment=64, device="cpu")
         execute_plan_on_tensors_multi(plan, src_regions, dst_regions, pool)
 
         assert d0[:block].tolist() == s0[:block].tolist()
@@ -465,7 +465,7 @@ class TestExecutePlanMulti:
         assert len(plan.direct_runs) > 0
         assert len(plan.packed_chunks) > 0
 
-        pool = StagingPool(num_slots=2, slot_capacity=_MIB, alignment=64, device="cpu")
+        pool = StagingAllocator(capacity_bytes=2 * _MIB, page_size=64, alignment=64, device="cpu")
         execute_plan_on_tensors_multi(plan, src_regions, dst_regions, pool)
 
         assert d0[:2048].tolist() == s0[:2048].tolist()
@@ -500,7 +500,7 @@ class TestExecutePlanMulti:
         plan_s = planner.plan(spans_s, peer_session="s0")
         plan_m = planner.plan(spans_m, peer_session="s0")
 
-        pool = StagingPool(num_slots=2, slot_capacity=_MIB, alignment=64, device="cpu")
+        pool = StagingAllocator(capacity_bytes=2 * _MIB, page_size=64, alignment=64, device="cpu")
         execute_plan_on_tensors(plan_s, src, src_base, dst_single, dst_base_s, pool)
         execute_plan_on_tensors_multi(
             plan_m, [(src_base, src)], [(dst_base_m, dst_multi)], pool,
@@ -521,29 +521,63 @@ class TestBudget:
     def test_reservation_includes_alignment(self) -> None:
         alignment = 2 * _MIB
         cap = 16 * _MIB
-        cfg = StagingConfig(enabled=True, num_slots=2, slot_capacity=cap, alignment=alignment)
+        cfg = StagingConfig(enabled=True, arena_capacity=2 * cap, page_size=cap, alignment=alignment)
         res = compute_staging_reservation(cfg)
-        slot_stride = ((cap + alignment - 1) // alignment) * alignment
-        expected = 2 * slot_stride + alignment - 1
+        expected = 2 * cap + alignment - 1
         assert res == expected
 
     def test_config_from_env_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("VLLM_ASCEND_STAGING_ENABLED", raising=False)
-        monkeypatch.delenv("VLLM_ASCEND_STAGING_NUM_SLOTS", raising=False)
-        monkeypatch.delenv("VLLM_ASCEND_STAGING_SLOT_CAPACITY_MIB", raising=False)
+        monkeypatch.delenv("VLLM_ASCEND_STAGING_CAPACITY_MIB", raising=False)
+        monkeypatch.delenv("VLLM_ASCEND_STAGING_CHUNK_CAPACITY_MIB", raising=False)
+        monkeypatch.delenv("VLLM_ASCEND_STAGING_MAX_CONCURRENT_CHUNKS", raising=False)
+        monkeypatch.delenv("VLLM_ASCEND_STAGING_PAGE_SIZE_KIB", raising=False)
         cfg = staging_config_from_env()
         assert cfg.enabled is False
-        assert cfg.num_slots == 2
-        assert cfg.slot_capacity == 16 * _MIB
+        assert cfg.arena_capacity == 32 * _MIB
+        assert cfg.chunk_capacity == 16 * _MIB
+        assert cfg.page_size == 256 * 1024
+        assert cfg.alignment == 2 * _MIB
 
     def test_config_from_env_custom(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("VLLM_ASCEND_STAGING_ENABLED", "1")
-        monkeypatch.setenv("VLLM_ASCEND_STAGING_NUM_SLOTS", "4")
-        monkeypatch.setenv("VLLM_ASCEND_STAGING_SLOT_CAPACITY_MIB", "32")
+        monkeypatch.setenv("VLLM_ASCEND_STAGING_CAPACITY_MIB", "64")
+        monkeypatch.setenv("VLLM_ASCEND_STAGING_CHUNK_CAPACITY_MIB", "32")
+        monkeypatch.setenv("VLLM_ASCEND_STAGING_MAX_CONCURRENT_CHUNKS", "4")
+        monkeypatch.setenv("VLLM_ASCEND_STAGING_PAGE_SIZE_KIB", "256")
         cfg = staging_config_from_env()
         assert cfg.enabled is True
-        assert cfg.num_slots == 4
-        assert cfg.slot_capacity == 32 * _MIB
+        assert cfg.arena_capacity == 64 * _MIB
+        assert cfg.chunk_capacity == 32 * _MIB
+        assert cfg.max_concurrent_chunks == 4
+        assert cfg.page_size == 256 * 1024
+        assert cfg.v1_max_prompt_tokens == 8192
+
+    def test_config_from_env_custom_v1_prompt_cutoff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VLLM_ASCEND_STAGING_V1_MAX_PROMPT_TOKENS", "4096")
+        cfg = staging_config_from_env()
+        assert cfg.v1_max_prompt_tokens == 4096
+
+    def test_config_from_env_rejects_invalid_page_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VLLM_ASCEND_STAGING_PAGE_SIZE_KIB", "300")
+        with pytest.raises(ValueError, match="positive power of two"):
+            staging_config_from_env()
+
+    def test_config_from_env_rejects_chunk_smaller_than_direct_threshold(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_ASCEND_STAGING_CHUNK_CAPACITY_MIB", "4")
+        monkeypatch.setenv("VLLM_ASCEND_STAGING_MIN_DIRECT_SIZE", str(5 * _MIB))
+        with pytest.raises(ValueError, match="chunk capacity.*direct-transfer threshold"):
+            staging_config_from_env()
+
+    def test_config_rejects_chunk_smaller_than_direct_threshold(self) -> None:
+        with pytest.raises(ValueError, match="chunk capacity.*direct-transfer threshold"):
+            StagingConfig(chunk_capacity=4 * _MIB, min_direct_size=5 * _MIB)
+
+    def test_config_rejects_negative_v1_prompt_cutoff(self) -> None:
+        with pytest.raises(ValueError, match="VLLM_ASCEND_STAGING_V1_MAX_PROMPT_TOKENS"):
+            StagingConfig(v1_max_prompt_tokens=-1)
 
 
 # =====================================================================
@@ -556,8 +590,7 @@ class TestStagingReservationDeduction:
 
     def test_deduction_when_enabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("VLLM_ASCEND_STAGING_ENABLED", "1")
-        monkeypatch.setenv("VLLM_ASCEND_STAGING_NUM_SLOTS", "2")
-        monkeypatch.setenv("VLLM_ASCEND_STAGING_SLOT_CAPACITY_MIB", "16")
+        monkeypatch.setenv("VLLM_ASCEND_STAGING_CAPACITY_MIB", "32")
 
         cfg = staging_config_from_env()
         reservation = compute_staging_reservation(cfg)
@@ -575,21 +608,21 @@ class TestStagingReservationDeduction:
         assert reservation == 0
 
     def test_deduction_clamps_to_zero(self) -> None:
-        cfg = StagingConfig(enabled=True, num_slots=100, slot_capacity=64 * _MIB)
+        cfg = StagingConfig(enabled=True, arena_capacity=64 * _MIB)
         reservation = compute_staging_reservation(cfg)
         available = 10 * _MIB
         remaining = max(available - reservation, 0)
         assert remaining == 0
 
     def test_reservation_matches_pool_allocation(self) -> None:
-        """Reservation bytes >= actual StagingPool raw tensor size."""
-        cfg = StagingConfig(enabled=True, num_slots=2, slot_capacity=16 * _MIB)
+        """Reservation includes arena storage and alignment overhead."""
+        cfg = StagingConfig(enabled=True, arena_capacity=32 * _MIB)
         reservation = compute_staging_reservation(cfg)
-        pool = StagingPool(
-            num_slots=cfg.num_slots,
-            slot_capacity=cfg.slot_capacity,
+        allocator = StagingAllocator(
+            capacity_bytes=cfg.arena_capacity,
+            page_size=cfg.page_size,
             alignment=cfg.alignment,
             device="cpu",
         )
-        actual = pool._raw_tensor.numel()
+        actual = allocator._raw_tensor.numel()
         assert reservation >= actual

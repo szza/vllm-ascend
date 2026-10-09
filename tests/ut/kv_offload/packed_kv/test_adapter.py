@@ -16,7 +16,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
     TransferPlanner,
     spans_from_block_mapping,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
+from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator
 
 _MIB = 1024 * 1024
 
@@ -235,7 +235,7 @@ class TestAdapterEndToEnd:
         spans = spans_from_flat_entries(src_list, dst_list, length_list, request_id="r0")
         planner = TransferPlanner(min_direct_size=2048, chunk_capacity=8192)
         plan = planner.plan(spans, peer_session="p0")
-        pool = StagingPool(num_slots=4, slot_capacity=8192, alignment=64, device="cpu")
+        pool = StagingAllocator(capacity_bytes=4 * 8192, page_size=64, alignment=64, device="cpu")
         execute_plan_on_tensors(plan, src, src_base, dst, dst_base, pool)
 
         # Verify byte correctness
@@ -276,7 +276,7 @@ class TestAdapterEndToEnd:
 
         planner = TransferPlanner(min_direct_size=1024, chunk_capacity=4096)
         plan = planner.plan(all_spans, peer_session="p0")
-        pool = StagingPool(num_slots=4, slot_capacity=4096, alignment=64, device="cpu")
+        pool = StagingAllocator(capacity_bytes=4 * 4096, page_size=64, alignment=64, device="cpu")
         execute_plan_on_tensors(plan, src, src_base, dst, dst_base, pool)
 
         # Verify
@@ -313,7 +313,7 @@ class TestAdapterEndToEnd:
         spans = spans_from_flat_entries(src_list, dst_list, length_list, request_id="r0")
         planner = TransferPlanner(min_direct_size=_MIB, chunk_capacity=_MIB)
         plan = planner.plan(spans, peer_session="p0")
-        pool = StagingPool(num_slots=2, slot_capacity=_MIB, alignment=64, device="cpu")
+        pool = StagingAllocator(capacity_bytes=2 * _MIB, page_size=64, alignment=64, device="cpu")
         execute_plan_on_tensors(plan, src, src_base, dst, dst_base, pool)
 
         # Check transferred blocks match

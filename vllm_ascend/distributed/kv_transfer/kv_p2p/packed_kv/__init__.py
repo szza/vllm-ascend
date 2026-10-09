@@ -4,6 +4,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.adapter import (
     plan_from_flat_entries,
     spans_from_flat_entries,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import (
+    StagingAllocator,
+    StagingLease,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.budget import (
     StagingConfig,
     compute_staging_reservation,
@@ -39,11 +43,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
     TransferPlan,
     TransferPlanner,
     spans_from_block_mapping,
-)
-from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import (
-    SlotState,
-    StagingPool,
-    StagingSlot,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
     PackReadyBatchItem,
@@ -88,12 +87,12 @@ __all__ = [
     "ScatterEntry",
     "SlotState",
     "StagedTransferResult",
+    "StagingAllocator",
     "StagingCapabilityMsg",
     "StagingConfig",
     "StagingErrorMsg",
     "StagingMsgType",
-    "StagingPool",
-    "StagingSlot",
+    "StagingLease",
     "TransferPlan",
     "TransferPlanner",
     "WriteDoneMsg",

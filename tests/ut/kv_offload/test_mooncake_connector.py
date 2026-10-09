@@ -75,6 +75,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
     group_concurrent_contiguous,
     split_if_not_byte_contiguous,
     string_to_int64_hash,
+    _should_use_v1_staging,
+    _staging_payload_bytes,
     zmq_ctx,
 )
 
@@ -280,15 +282,9 @@ class TestKVCacheSendingThread(unittest.TestCase):
         context.term()
 
     def test_staging_executor_reassembles_batch_by_chunk_order(self):
-        class FakePool:
-            num_slots = 2
-
-            @staticmethod
-            def slot_view(_slot_id):
-                return types.SimpleNamespace(device=torch.device("cpu"))
-
         class FakeStagingService:
-            pool = FakePool()
+            allocator = types.SimpleNamespace(device=torch.device("cpu"))
+            max_concurrent_chunks = 2
 
             @staticmethod
             def handle_prepare_read(msg):
@@ -298,7 +294,8 @@ class TestKVCacheSendingThread(unittest.TestCase):
                 return PackReadyMsg(
                     transfer_id=msg.transfer_id,
                     chunk_id=msg.chunk_id,
-                    slot_addr=0x1000 + msg.chunk_id,
+                    lease_id=100 + msg.chunk_id,
+                    staging_addr=0x1000 + msg.chunk_id,
                     payload_bytes=msg.total_bytes,
                     gather_ms=1.0,
                 )
@@ -1377,6 +1374,21 @@ class TestKVCacheTaskTracker(unittest.TestCase):
         finished = self.tracker.get_and_clear_finished_requests()
         self.assertEqual(finished, {"req1"})
 
+    def test_staged_completion_consumes_late_done(self):
+        self.tracker.add_req_to_process("req-staged")
+        self.tracker.add_delayed_request("req-staged", time.time())
+
+        self.tracker.mark_staged_transfer_complete("req-staged")
+        self.assertEqual(self.tracker.finished_requests, {"req-staged"})
+        self.assertEqual(self.tracker.delayed_free_requests, {})
+        self.assertEqual(self.tracker.reqs_to_process, set())
+        self.assertEqual(self.tracker.early_completed_requests, {"req-staged"})
+
+        # DONE_RECVING arrives after D has read/scattered the staging extent.
+        self.tracker.update_done_task_count("req-staged")
+        self.assertEqual(self.tracker.finished_requests, {"req-staged"})
+        self.assertEqual(self.tracker.early_completed_requests, set())
+
 
 class TestMooncakeConnectorMetadata(unittest.TestCase):
     def test_add_new_req(self):
@@ -1466,6 +1478,23 @@ class TestMooncakeConnectorSchedulerMatchedTokens(unittest.TestCase):
 
 
 class TestHelperFunctions(unittest.TestCase):
+    def test_v1_staging_prompt_cutoff(self):
+        self.assertTrue(_should_use_v1_staging(4096, 8192))
+        self.assertTrue(_should_use_v1_staging(8192, 8192))
+        self.assertFalse(_should_use_v1_staging(8193, 8192))
+        self.assertFalse(_should_use_v1_staging(131072, 8192))
+        self.assertTrue(_should_use_v1_staging(131072, 0))
+
+    def test_staging_payload_exceeds_allocator_capacity(self):
+        min_direct_size = 5 * 1024 * 1024
+        capacity_bytes = 512 * 1024 * 1024
+        small = [74 * 1024] * 10
+        self.assertLess(_staging_payload_bytes(small, min_direct_size), capacity_bytes)
+        direct_only = [min_direct_size, min_direct_size + 1]
+        self.assertEqual(_staging_payload_bytes(direct_only, min_direct_size), 0)
+        oversized = [74 * 1024] * 80000
+        self.assertGreater(_staging_payload_bytes(oversized, min_direct_size), capacity_bytes)
+
     def test_group_concurrent_contiguous(self):
         src: list[int] = [1, 2, 3, 5, 6]
         dst: list[int] = [10, 11, 12, 14, 15]
@@ -3224,6 +3253,24 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         worker.pcp_size = 1
         worker.dcp_size = 2
         worker.block_size = 16
+        meta = types.SimpleNamespace(
+            remote_pcp_size=1,
+            remote_dcp_size=2,
+            remote_block_ids=([10, 11],),
+            local_block_ids=([20],),
+            local_full_block_ids=tuple(),
+            num_external_tokens=32,
+            num_prompt_blocks=3,
+            num_computed_tokens=16,
+        )
+
+        with self.assertRaises(AssertionError):
+            worker._get_sfa_replicate_k_block_ids(cast(ReqMeta, meta))
+
+
+if __name__ == "__main__":
+    unittest.main()
+lock_size = 16
         meta = types.SimpleNamespace(
             remote_pcp_size=1,
             remote_dcp_size=2,

@@ -127,6 +127,26 @@ class ReqMeta:
     num_prompt_blocks: int
     remote_block_size: int
     local_full_block_ids: BlockIds = tuple()
+    prompt_len: int = 0
+
+
+def _should_use_v1_staging(prompt_len: int, max_prompt_tokens: int) -> bool:
+    """Use staging at or below the V1 prompt cutoff; zero disables the cutoff."""
+    return max_prompt_tokens == 0 or prompt_len <= max_prompt_tokens
+
+
+def _staging_length_bytes(length: int, min_direct_size: int) -> int:
+    """Staging-arena bytes for one descriptor; direct-sized entries contribute zero."""
+    if length <= 0:
+        return 0
+    if min_direct_size <= 0 or length < min_direct_size:
+        return length
+    return 0
+
+
+def _staging_payload_bytes(lengths: list[int], min_direct_size: int) -> int:
+    """Bytes that would occupy the staging arena for this transfer."""
+    return sum(_staging_length_bytes(length, min_direct_size) for length in lengths)
 
 
 @dataclass(frozen=True)
@@ -177,6 +197,10 @@ class KVCacheTaskTracker:
         # be force-freed.
         self.delayed_free_requests: OrderedDict[str, float] = OrderedDict()
         self.reqs_to_process: set[str] = set()
+        # A fully staged transfer can publish completion before D sends its
+        # request-level DONE_RECVING.  Keep that state so the later wire
+        # message is consumed idempotently without a duplicate warning.
+        self.early_completed_requests: set[str] = set()
 
     def add_req_to_process(self, request_id: str):
         self.reqs_to_process.add(request_id)
@@ -192,6 +216,8 @@ class KVCacheTaskTracker:
                 self.finished_requests.add(request_id)
                 self.reqs_to_process.discard(request_id)
                 self.delayed_free_requests.pop(request_id, None)
+            elif request_id in self.early_completed_requests:
+                self.early_completed_requests.discard(request_id)
             else:
                 logger.warning(
                     "MooncakeConnector finish req not in reqs to process. "
@@ -200,6 +226,24 @@ class KVCacheTaskTracker:
                     "Check: Verify request lifecycle and tracking logic.",
                     request_id,
                 )
+
+    def mark_staged_transfer_complete(self, request_id: str) -> None:
+        """Complete a fully staged request before its wire DONE message.
+
+        The scheduler must see the same finished request event as it would
+        after ``DONE_RECVING``.  The later wire message is still expected for
+        protocol cleanup, so remember that this request was completed early
+        and consume the message without publishing a second event.
+        """
+        with self.done_task_lock:
+            if request_id not in self.reqs_to_process:
+                # A request may have been force-freed or completed by another
+                # path while the gather callback was in flight.
+                return
+            self.finished_requests.add(request_id)
+            self.reqs_to_process.discard(request_id)
+            self.delayed_free_requests.pop(request_id, None)
+            self.early_completed_requests.add(request_id)
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -302,9 +346,9 @@ class KVCacheSendingThread(threading.Thread):
             # NPU device selection is thread-local.  Gather workers must use
             # the same device as the P-side staging pool; CPU pools do not need
             # an initializer.
-            staging_device = staging_service.pool.slot_view(0).device
+            staging_device = staging_service.allocator.device
             executor_kwargs: dict[str, Any] = {
-                "max_workers": staging_service.pool.num_slots,
+                "max_workers": staging_service.max_concurrent_chunks,
                 "thread_name_prefix": "staging-gather",
             }
             if getattr(staging_device, "type", None) == "npu":
@@ -313,7 +357,7 @@ class KVCacheSendingThread(threading.Thread):
             self._staging_executor = concurrent.futures.ThreadPoolExecutor(**executor_kwargs)
             logger.info(
                 "P staging gather executor initialized: workers=%d device=%s",
-                staging_service.pool.num_slots,
+                staging_service.max_concurrent_chunks,
                 staging_device,
             )
         self._staging_futures: list[_PendingStagingGather] = []
@@ -343,6 +387,16 @@ class KVCacheSendingThread(threading.Thread):
 
     def add_delayed_request(self, request_id: str, delay_start_time: float):
         return self.task_tracker.add_delayed_request(request_id, delay_start_time)
+
+    def mark_staged_transfer_complete(self, request_id: str) -> None:
+        """Publish the same completion event used by DONE_RECVING.
+
+        This callback is only installed for D plans made entirely of staging
+        chunks.  The scheduler receives the request ID through the normal
+        ``finished_sending`` path and performs its regular block lifecycle
+        action.
+        """
+        self.task_tracker.mark_staged_transfer_complete(request_id)
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -545,6 +599,8 @@ class KVCacheSendingThread(threading.Thread):
                         chunk_id=item.chunk_id,
                         gather_entries=item.gather_entries,
                         total_bytes=item.total_bytes,
+                        release_source_when_ready=msg.release_source_when_ready,
+                        expected_chunks=msg.expected_chunks,
                     ),
                 )
                 for index, item in enumerate(msg.chunks)
@@ -650,11 +706,12 @@ class KVCacheSendingThread(threading.Thread):
                             item = gather.request.chunks[index]
                             logger.info(
                                 "P staging gather completed: transfer_id=%s chunk_id=%d success=%s "
-                                "slot_addr=%s payload_bytes=%s gather_ms=%.2f",
+                                "staging_addr=%s lease_id=%s payload_bytes=%s gather_ms=%.2f",
                                 gather.request.transfer_id,
                                 item.chunk_id,
                                 isinstance(result, PackReadyMsg),
-                                f"0x{result.slot_addr:x}" if isinstance(result, PackReadyMsg) else "-",
+                                f"0x{result.staging_addr:x}" if isinstance(result, PackReadyMsg) else "-",
+                                result.lease_id if isinstance(result, PackReadyMsg) else "-",
                                 result.payload_bytes if isinstance(result, PackReadyMsg) else 0,
                                 result.gather_ms if isinstance(result, PackReadyMsg) else 0.0,
                             )
@@ -718,7 +775,8 @@ class KVCacheSendingThread(threading.Thread):
                                 PackReadyBatchItem(
                                     chunk_id=item.chunk_id,
                                     success=True,
-                                    slot_addr=response.slot_addr,
+                                    lease_id=response.lease_id,
+                                    staging_addr=response.staging_addr,
                                     payload_bytes=response.payload_bytes,
                                     gather_ms=response.gather_ms,
                                 )
@@ -889,7 +947,12 @@ class KVCacheSendingThread(threading.Thread):
             )
             for item in msg.results:
                 self.staging_service.handle_read_ack(
-                    ReadAckMsg(transfer_id=msg.transfer_id, chunk_id=item.chunk_id, success=item.success)
+                    ReadAckMsg(
+                        transfer_id=msg.transfer_id,
+                        chunk_id=item.chunk_id,
+                        lease_id=item.lease_id,
+                        success=item.success,
+                    )
                 )
             sock.send_multipart((identity, b"", b"ACK"))
         else:
@@ -920,6 +983,7 @@ class KVCacheRecvingThread(threading.Thread):
         staging_coordinator: Any = None,
         staging_enabled: bool = False,
         staging_min_direct_size: int | None = None,
+        staging_v1_max_prompt_tokens: int = 8192,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
         self.tp_rank = tp_rank
@@ -932,6 +996,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.staging_coordinator = staging_coordinator
         self.staging_enabled = staging_enabled
         self.staging_min_direct_size = staging_min_direct_size
+        self.staging_v1_max_prompt_tokens = staging_v1_max_prompt_tokens
         if ready_event is None:
             ready_event = threading.Event()
         self.ready_event = ready_event
@@ -1064,6 +1129,7 @@ class KVCacheRecvingThread(threading.Thread):
         shard_idx: int = 0,
         local_block_ids_replicate_k: BlockIds | None = None,
         remote_block_ids_replicate_k: BlockIds | None = None,
+        prompt_len: int = 0,
     ):
         """Add a new request to the queue for processing."""
         if remote_port_send_num is None:
@@ -1084,6 +1150,7 @@ class KVCacheRecvingThread(threading.Thread):
             "all_task_done": all_task_done,
             "shard_idx": shard_idx,
             "remote_block_size": remote_block_size,
+            "prompt_len": prompt_len,
         }
         logger.debug("Adding request %s to the queue.Trans info:%s", request_id, trans_info)
         self.request_queue.put(trans_info)
@@ -1352,6 +1419,10 @@ class KVCacheRecvingThread(threading.Thread):
         src_list: list[int] = []
         dst_list: list[int] = []
         length_list: list[int] = []
+        track_staging = self.staging_enabled and self.staging_coordinator is not None
+        min_direct_size = self.staging_min_direct_size or 0
+        staging_bytes = 0
+        capacity_bytes = self.staging_coordinator.allocator.capacity_bytes if track_staging else 0
         attention_group_reformat_block_ids: list[tuple[tuple[int, list[list[int]], int, list[int]], bool]] = []
         grouped_remote_k_block_ids: list[list[int]] = []
         grouped_local_k_block_ids: list[list[int]] = []
@@ -1415,6 +1486,7 @@ class KVCacheRecvingThread(threading.Thread):
             if is_mamba_group:
                 for layer_idx in layer_indices:
                     start_meta_idx = len(src_list)
+                    mamba_length_start = len(length_list)
                     self._append_mamba_transfer_meta(
                         src_list,
                         dst_list,
@@ -1430,6 +1502,10 @@ class KVCacheRecvingThread(threading.Thread):
                         tp_num_need_pulls=tp_num_need_pulls,
                         remote_tp_offset=inner_offset,
                     )
+                    if track_staging:
+                        staging_bytes += _staging_payload_bytes(
+                            length_list[mamba_length_start:], min_direct_size
+                        )
                     if logger.isEnabledFor(logging.DEBUG):
                         for src, dst, length in zip(
                             src_list[start_meta_idx:], dst_list[start_meta_idx:], length_list[start_meta_idx:]
@@ -1480,6 +1556,8 @@ class KVCacheRecvingThread(threading.Thread):
                         src_list.append(src)
                         dst_list.append(dst)
                         length_list.append(length)
+                        if track_staging:
+                            staging_bytes += _staging_length_bytes(length, min_direct_size)
                     logger.debug(
                         "Mooncake kv transfer meta: request_id=%s group_idx=%s layer_idx=%s local_block_ids=%s "
                         "remote_block_ids=%s tp_num_need_pulls=%s remote_tp_offset=%s session_id=%s",
@@ -1512,13 +1590,35 @@ class KVCacheRecvingThread(threading.Thread):
             dst_list,
             length_list,
         )
-        if self.staging_enabled and self.staging_coordinator is not None:
+        prompt_len = int(req_meta.get("prompt_len", 0))
+        max_prompt_tokens = self.staging_v1_max_prompt_tokens
+        use_staging = (
+            track_staging
+            and staging_bytes <= capacity_bytes
+            and _should_use_v1_staging(prompt_len, max_prompt_tokens)
+        )
+        if track_staging and not use_staging:
             logger.info(
-                "Using STAGING path: %d entries, total %d bytes, session=%s, request=%s",
+                "Bypassing Staging path: transfer_id=%s prompt_len=%d max_prompt_tokens=%d "
+                "staging_bytes=%d capacity_bytes=%d",
+                remote_request_id,
+                prompt_len,
+                max_prompt_tokens,
+                staging_bytes,
+                capacity_bytes,
+            )
+        if use_staging:
+            logger.info(
+                "Using Staging path: %d entries, total %d bytes, session=%s, request=%s, "
+                "prompt_len=%d, max_prompt_tokens=%d, staging_bytes=%d, capacity_bytes=%d",
                 len(src_list),
                 sum(length_list),
                 session_id,
                 remote_request_id,
+                prompt_len,
+                max_prompt_tokens,
+                staging_bytes,
+                capacity_bytes,
             )
             self._transfer_via_staging(
                 req_meta,
@@ -1712,7 +1812,7 @@ class KVCacheRecvingThread(threading.Thread):
             request_id=remote_request_id,
             peer_session=session_id,
             min_direct_size=self.staging_min_direct_size,
-            chunk_capacity=self.staging_coordinator.pool.slot_capacity,
+            chunk_capacity=self.staging_coordinator.chunk_capacity,
         )
         plan_ms = (time.perf_counter() - plan_started_at) * 1000
 
@@ -1723,6 +1823,12 @@ class KVCacheRecvingThread(threading.Thread):
             len(plan.packed_chunks),
             len(src_list),
         )
+        # Source blocks are safe to complete through the normal scheduler
+        # path only when every descriptor has an independent staging copy.
+        # Mixed plans still contain direct reads and must wait for D's
+        # request-level DONE_RECVING.
+        release_source_when_ready = not plan.direct_runs and bool(plan.packed_chunks)
+        expected_packed_chunks = len(plan.packed_chunks)
 
         direct_elapsed_ms = 0.0
 
@@ -1812,8 +1918,8 @@ class KVCacheRecvingThread(threading.Thread):
                 if not isinstance(decoded, PackReadyMsg):
                     raise ValueError(f"Unexpected staging response: {type(decoded).__name__}")
                 logger.info(
-                    "D-side PACK_READY: transfer_id=%s, chunk_id=%d, slot_addr=0x%x",
-                    decoded.transfer_id, decoded.chunk_id, decoded.slot_addr,
+                    "D-side PACK_READY: transfer_id=%s, chunk_id=%d, lease_id=%d, staging_addr=0x%x",
+                    decoded.transfer_id, decoded.chunk_id, decoded.lease_id, decoded.staging_addr,
                 )
                 return decoded
             finally:
@@ -2037,7 +2143,9 @@ class KVCacheRecvingThread(threading.Thread):
             send_ack_batch=send_ack_batch,
             rdma_read_batch=rdma_read_batch,
             merged_rdma_read=merged_rdma_read,
-            batch_window_size=self.staging_coordinator.pool.num_slots,
+            batch_window_size=self.staging_coordinator.max_concurrent_chunks,
+            release_source_when_ready=release_source_when_ready,
+            expected_packed_chunks=expected_packed_chunks,
         )
         staging_executor_ms = (time.perf_counter() - staging_started_at) * 1000
         # Keep direct, merged RDMA, and staging orchestration time separate so
@@ -2502,6 +2610,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             num_prompt_blocks=kv_transfer_params.get("num_prompt_blocks", 0),
             remote_block_size=kv_transfer_params.get("remote_block_size", 0),
             local_full_block_ids=local_full_block_ids or tuple(),
+            prompt_len=kv_transfer_params.get("prompt_len", 0),
         )
 
 
@@ -2862,12 +2971,18 @@ class MooncakeConnectorScheduler:
             # For the case where there are no remote blocks to pull
             # (block_ids is empty), we don't need to schedule
             # an async read on the worker side.
+            kv_transfer_params = dict(req.kv_transfer_params)
+            local_prompt_len = int(getattr(req, "num_prompt_tokens", 0) or 0)
+            if local_prompt_len <= 0 and req.prompt_token_ids:
+                local_prompt_len = len(req.prompt_token_ids)
+            if local_prompt_len > 0:
+                kv_transfer_params["prompt_len"] = local_prompt_len
             meta.add_new_req(
                 request_id=req_id,
                 local_block_ids=block_ids,
                 local_full_block_ids=full_block_ids,
                 num_external_tokens=num_external_tokens,
-                kv_transfer_params=req.kv_transfer_params,
+                kv_transfer_params=kv_transfer_params,
             )
 
         # Clear the list once workers start the transfers
@@ -2925,6 +3040,7 @@ class MooncakeConnectorScheduler:
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
             remote_block_size=self.block_size,
+            prompt_len=len(request.prompt_token_ids),
         )
 
     def _port_offset_from_handshake_metadata(
@@ -3451,6 +3567,8 @@ class MooncakeConnectorWorker:
                 self.pcp_rank,
                 staging_service=staging_service,
             )
+            if staging_service is not None:
+                staging_service.on_transfer_staged = self.kv_send_thread.mark_staged_transfer_complete
             self.kv_send_thread.start()
         else:
             self.kv_recv_thread = KVCacheRecvingThread(
@@ -3474,6 +3592,7 @@ class MooncakeConnectorWorker:
                 staging_coordinator=staging_coordinator,
                 staging_enabled=staging_enabled,
                 staging_min_direct_size=staging_config.min_direct_size,
+                staging_v1_max_prompt_tokens=staging_config.v1_max_prompt_tokens,
             )
             self.kv_recv_thread.start()
         start_wait_time = time.time()
@@ -3489,7 +3608,7 @@ class MooncakeConnectorWorker:
     def _create_staging_components(self, kv_caches: dict[str, torch.Tensor], config: Any) -> tuple[Any, Any]:
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.d_coordinator import DecodeStagingCoordinator
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.p_service import PrefillStagingService
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator
 
         first_value = next(iter(kv_caches.values()))
         first_tensor = self._as_kv_cache_tuple(first_value)[0]
@@ -3507,33 +3626,36 @@ class MooncakeConnectorWorker:
             kv_regions.append((ptr, placeholder))
         kv_regions.sort(key=lambda region: region[0])
 
-        pool = StagingPool(
-            num_slots=config.num_slots,
-            slot_capacity=config.slot_capacity,
+        allocator = StagingAllocator(
+            capacity_bytes=config.arena_capacity,
+            page_size=config.page_size,
             alignment=config.alignment,
             device=str(device),
         )
-        pool.register(self.engine)
+        allocator.register(self.engine)
         dummy_tensor = torch.empty(0, dtype=torch.int8, device=device)
         if self.kv_role == "kv_producer":
             component = PrefillStagingService(
-                pool=pool,
+                allocator=allocator,
+                max_concurrent_chunks=config.max_concurrent_chunks,
                 kv_tensor=dummy_tensor,
                 kv_base_addr=0,
                 kv_regions=kv_regions,
             )
-            logger.info("P-side staging enabled: %d slots x %d bytes, device=%s", config.num_slots, config.slot_capacity, device)
+            logger.info("P-side staging enabled: arena=%d bytes page=%d bytes device=%s", config.arena_capacity, config.page_size, device)
             for i, (base, t) in enumerate(kv_regions):
                 region_len = t.numel() * t.element_size()
                 logger.info("P-side kv_region[%d]: base=0x%x, end=0x%x, len=%d", i, base, base + region_len, region_len)
         else:
             component = DecodeStagingCoordinator(
-                pool=pool,
+                allocator=allocator,
                 dst_tensor=dummy_tensor,
                 dst_base_addr=0,
                 dst_regions=kv_regions,
+                chunk_capacity=config.chunk_capacity,
+                max_concurrent_chunks=config.max_concurrent_chunks,
             )
-            logger.info("D-side staging enabled: %d slots x %d bytes, device=%s", config.num_slots, config.slot_capacity, device)
+            logger.info("D-side staging enabled: arena=%d bytes page=%d bytes device=%s", config.arena_capacity, config.page_size, device)
         return (component, None) if self.kv_role == "kv_producer" else (None, component)
 
     def get_finished(self) -> tuple[set[str], set[str]]:
@@ -4527,6 +4649,7 @@ class MooncakeConnectorWorker:
                         remote_block_size=meta.remote_block_size,
                         local_block_ids_replicate_k=local_block_ids_replicate_k_for_port,
                         remote_block_ids_replicate_k=remote_block_ids_replicate_k_for_port,
+                        prompt_len=meta.prompt_len,
                     )
 
         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size == 1:

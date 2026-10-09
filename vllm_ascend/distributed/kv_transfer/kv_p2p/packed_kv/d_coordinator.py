@@ -10,7 +10,7 @@ Orchestrates the full READY → READ → SCATTER → ACK cycle for a
    with the first staging window.
 2. **Packed chunks** go through the staging protocol:
    acquire D slot → PREPARE_READ → PACK_READY → RDMA read (one large
-   entry) → scatter from D slot → READ_ACK → release D slot.
+   entry) → READ_ACK (release P lease) → scatter from D slot → release D slot.
 
 The coordinator is transport-agnostic: the actual RDMA read and
 P-service communication are supplied via callbacks so the module can
@@ -36,8 +36,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
     PackedChunk,
     TransferPlan,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
+from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator, StagingLease
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+    STAGING_ERR_ARENA_EXHAUSTED,
     PackReadyBatchMsg,
     PackReadyMsg,
     PrepareReadBatchItem,
@@ -95,13 +96,27 @@ class StagedTransferResult:
     error: str | None = None
 
 
+@dataclass
+class _WindowOutcome:
+    """Result of one staging window, including a direct-RDMA fallback."""
+
+    error: str | None = None
+    packed_bytes: int = 0
+    packed_entries: int = 0
+    chunks_completed: int = 0
+    direct_completed: bool = False
+    fallback_rest: bool = False
+    direct_bytes: int = 0
+    direct_entries: int = 0
+
+
 class DecodeStagingCoordinator:
     """D-side orchestrator for staged KV cache transfers.
 
     Parameters
     ----------
-    pool : StagingPool
-        D-side staging pool for receiving packed data.
+    allocator : StagingAllocator
+        D-side staging arena for receiving packed data.
     dst_tensor : torch.Tensor
         Flat view of D-side KV cache.
     dst_base_addr : int
@@ -110,15 +125,19 @@ class DecodeStagingCoordinator:
 
     def __init__(
         self,
-        pool: StagingPool,
+        allocator: StagingAllocator,
         dst_tensor: torch.Tensor,
         dst_base_addr: int,
         dst_regions: list[tuple[int, torch.Tensor]] | None = None,
+        chunk_capacity: int | None = None,
+        max_concurrent_chunks: int = 1,
     ) -> None:
-        self.pool = pool
+        self.allocator = allocator
         self.dst_tensor = dst_tensor
         self.dst_base_addr = dst_base_addr
         self.dst_regions = dst_regions or []
+        self.chunk_capacity = chunk_capacity or allocator.capacity_bytes
+        self.max_concurrent_chunks = max_concurrent_chunks
 
     def execute(
         self,
@@ -134,6 +153,8 @@ class DecodeStagingCoordinator:
         rdma_read_batch: RdmaReadBatchFn | None = None,
         merged_rdma_read: RdmaReadBatchFn | None = None,
         batch_window_size: int | None = None,
+        release_source_when_ready: bool = False,
+        expected_packed_chunks: int = 0,
     ) -> StagedTransferResult:
         """Execute a full TransferPlan.
 
@@ -151,7 +172,8 @@ class DecodeStagingCoordinator:
         rdma_read : callable
             RDMA read from P slot to D slot (single large entry).
         send_ack : callable
-            Sends READ_ACK to P after scatter.
+            Sends READ_ACK to P after the RDMA read completes. Scatter does
+            not use the P extent, so the P lease is not held across it.
         prepare_read_batch : callable, optional
             Batched PREPARE_READ callback. Used for multi-chunk windows and
             for a mixed DirectRun + single-chunk window when available.
@@ -164,8 +186,7 @@ class DecodeStagingCoordinator:
             Batched RDMA callback used when DirectRun and staging descriptors
             are submitted together. If omitted, ``rdma_read_batch`` is used.
         batch_window_size : int, optional
-            Maximum number of chunks in one batch. Defaults to the number of
-            D-side staging slots.
+            Maximum number of chunks in one batch. Defaults to one chunk.
         """
         result = StagedTransferResult(success=True)
 
@@ -193,7 +214,7 @@ class DecodeStagingCoordinator:
         if direct_pending and len(plan.packed_chunks) == 1:
             use_batch = prepare_read_batch is not None and send_ack_batch is not None
         if use_batch:
-            window_size = batch_window_size or self.pool.num_slots
+            window_size = batch_window_size or 1
             if window_size <= 0:
                 result.success = False
                 result.error = f"invalid batch window size: {window_size}"
@@ -205,52 +226,59 @@ class DecodeStagingCoordinator:
         else:
             packed_batches = ((chunk,) for chunk in plan.packed_chunks)
 
+        fallback_rest = False
+        direct_accounted = result.direct_entries > 0
         for packed_batch in packed_batches:
-            if use_batch:
-                batch_result = self._execute_batch(
+            pending_descriptors = direct_descriptors if direct_pending else ()
+            if fallback_rest:
+                outcome = self._arena_fallback_outcome(
+                    packed_batch,
+                    direct_transfer,
+                    error="previous window found no contiguous staging extent; remaining chunks use direct RDMA",
+                )
+            elif use_batch:
+                outcome = self._execute_batch(
                     packed_batch,
                     transfer_id=transfer_id,
                     prepare_read_batch=prepare_read_batch,
                     rdma_read=rdma_read,
                     rdma_read_batch=merged_read if direct_pending else rdma_read_batch,
                     send_ack_batch=send_ack_batch,
-                    direct_descriptors=direct_descriptors if direct_pending else (),
+                    direct_descriptors=pending_descriptors,
+                    release_source_when_ready=release_source_when_ready,
+                    expected_packed_chunks=expected_packed_chunks,
+                    direct_transfer=direct_transfer,
                 )
-                err, packed_bytes, packed_entries, chunks_completed, direct_completed = batch_result
-                result.packed_bytes += packed_bytes
-                result.packed_entries += packed_entries
-                result.chunks_completed += chunks_completed
-                if err is not None:
-                    result.success = False
-                    result.error = err
-                    return result
-                if direct_completed:
-                    result.direct_bytes = plan.total_direct_bytes
-                    result.direct_entries = len(plan.direct_runs)
-                    direct_pending = False
-                continue
-
-            chunk = packed_batch[0]
-            err = self._execute_chunk(
-                chunk,
-                transfer_id=transfer_id,
-                prepare_read=prepare_read,
-                rdma_read=rdma_read,
-                send_ack=send_ack,
-                rdma_read_batch=merged_read if direct_pending else None,
-                direct_descriptors=direct_descriptors if direct_pending else (),
-            )
-            if err is not None:
+            else:
+                outcome = self._execute_chunk(
+                    packed_batch[0],
+                    transfer_id=transfer_id,
+                    prepare_read=prepare_read,
+                    rdma_read=rdma_read,
+                    send_ack=send_ack,
+                    rdma_read_batch=merged_read if direct_pending else None,
+                    direct_descriptors=pending_descriptors,
+                    release_source_when_ready=release_source_when_ready,
+                    expected_packed_chunks=expected_packed_chunks,
+                    direct_transfer=direct_transfer,
+                )
+            if outcome.error is not None:
                 result.success = False
-                result.error = err
+                result.error = outcome.error
                 return result
-            result.packed_bytes += chunk.payload_bytes
-            result.packed_entries += len(chunk.scatter_entries)
-            result.chunks_completed += 1
-            if direct_pending:
-                result.direct_bytes = plan.total_direct_bytes
-                result.direct_entries = len(plan.direct_runs)
+            result.packed_bytes += outcome.packed_bytes
+            result.packed_entries += outcome.packed_entries
+            result.chunks_completed += outcome.chunks_completed
+            result.direct_bytes += outcome.direct_bytes
+            result.direct_entries += outcome.direct_entries
+            if outcome.direct_completed and not direct_accounted:
+                result.direct_bytes += plan.total_direct_bytes
+                result.direct_entries += len(plan.direct_runs)
+                direct_accounted = True
+            if outcome.direct_completed or outcome.fallback_rest:
                 direct_pending = False
+            if outcome.fallback_rest:
+                fallback_rest = True
 
         return result
 
@@ -273,6 +301,69 @@ class DecodeStagingCoordinator:
             for run in plan.direct_runs
         )
 
+    def _direct_fallback_chunks(
+        self,
+        chunks: tuple[PackedChunk, ...] | list[PackedChunk],
+        direct_transfer: DirectTransferFn | None,
+        extra_descriptors: tuple[_ReadDescriptor, ...] = (),
+    ) -> str | None:
+        """RDMA packed fragments directly from P KV into D KV."""
+        if direct_transfer is None:
+            return "direct fallback unavailable"
+        src_addrs = [descriptor.remote_src for descriptor in extra_descriptors]
+        dst_addrs = [descriptor.local_dst for descriptor in extra_descriptors]
+        lengths = [descriptor.nbytes for descriptor in extra_descriptors]
+        for chunk in chunks:
+            if len(chunk.gather_entries) != len(chunk.scatter_entries):
+                return f"chunk {chunk.chunk_id} gather/scatter entry count mismatch"
+            for gather, scatter in zip(chunk.gather_entries, chunk.scatter_entries):
+                if gather.nbytes != scatter.nbytes:
+                    return f"chunk {chunk.chunk_id} gather/scatter size mismatch"
+                src_addrs.append(gather.src_offset)
+                dst_addrs.append(scatter.dst_offset)
+                lengths.append(gather.nbytes)
+        if not lengths:
+            return None
+        logger.info(
+            "D staging direct fallback: chunks=%d descriptors=%d bytes=%d",
+            len(chunks),
+            len(lengths),
+            sum(lengths),
+        )
+        ret = direct_transfer(src_addrs, dst_addrs, lengths)
+        if ret != 0:
+            return f"direct fallback RDMA failed: ret={ret}"
+        return None
+
+    def _arena_fallback_outcome(
+        self,
+        chunks: tuple[PackedChunk, ...] | list[PackedChunk],
+        direct_transfer: DirectTransferFn | None,
+        extra_descriptors: tuple[_ReadDescriptor, ...] = (),
+        error: str = "staging arena has no contiguous extent",
+    ) -> "_WindowOutcome":
+        chunk_ids = [chunk.chunk_id for chunk in chunks]
+        logger.info(
+            "D staging arena has no contiguous extent: chunks=%s free_bytes=%d capacity_bytes=%d "
+            "direct_fallback=%s reason=%s",
+            chunk_ids,
+            self.allocator.free_bytes,
+            self.allocator.capacity_bytes,
+            direct_transfer is not None,
+            error,
+        )
+        if direct_transfer is None:
+            return _WindowOutcome(error=error)
+        fallback_error = self._direct_fallback_chunks(chunks, direct_transfer, extra_descriptors)
+        if fallback_error is not None:
+            return _WindowOutcome(error=fallback_error)
+        return _WindowOutcome(
+            fallback_rest=True,
+            direct_completed=bool(extra_descriptors),
+            direct_bytes=sum(chunk.payload_bytes for chunk in chunks),
+            direct_entries=sum(len(chunk.gather_entries) for chunk in chunks),
+        )
+
     def _execute_chunk(
         self,
         chunk: PackedChunk,
@@ -282,18 +373,31 @@ class DecodeStagingCoordinator:
         send_ack: SendAckFn,
         rdma_read_batch: RdmaReadBatchFn | None = None,
         direct_descriptors: tuple[_ReadDescriptor, ...] = (),
-    ) -> str | None:
-        """Execute one packed chunk. Returns error string or None."""
-        if chunk.payload_bytes > self.pool.slot_capacity:
-            return (
-                f"chunk {chunk.chunk_id} exceeds D staging slot capacity: "
-                f"payload={chunk.payload_bytes}, capacity={self.pool.slot_capacity}"
+        release_source_when_ready: bool = False,
+        expected_packed_chunks: int = 0,
+        direct_transfer: DirectTransferFn | None = None,
+    ) -> "_WindowOutcome":
+        """Execute one packed chunk. Arena exhaustion falls back to direct RDMA."""
+        if chunk.payload_bytes > self.allocator.capacity_bytes:
+            return self._arena_fallback_outcome(
+                (chunk,),
+                direct_transfer,
+                direct_descriptors,
+                error=(
+                    f"chunk {chunk.chunk_id} exceeds D staging arena capacity: "
+                    f"payload={chunk.payload_bytes}, capacity={self.allocator.capacity_bytes}"
+                ),
             )
 
         t0 = time.perf_counter()
-        slot = self.pool.acquire()
-        if slot is None:
-            return f"no D staging slot for chunk {chunk.chunk_id}"
+        lease = self.allocator.allocate(chunk.payload_bytes)
+        if lease is None:
+            return self._arena_fallback_outcome(
+                (chunk,),
+                direct_transfer,
+                direct_descriptors,
+                error=f"no contiguous D staging extent for chunk {chunk.chunk_id}",
+            )
         t_acquire = time.perf_counter()
 
         try:
@@ -302,32 +406,47 @@ class DecodeStagingCoordinator:
                 chunk_id=chunk.chunk_id,
                 gather_entries=[(g.src_offset, g.packed_offset, g.nbytes) for g in chunk.gather_entries],
                 total_bytes=chunk.payload_bytes,
+                release_source_when_ready=release_source_when_ready,
+                expected_chunks=expected_packed_chunks,
             )
 
             response = prepare_read(prepare_msg)
             t_prepare = time.perf_counter()
 
             if isinstance(response, StagingErrorMsg):
-                return f"P rejected PREPARE_READ for chunk {chunk.chunk_id}: {response.reason}"
+                if response.code == STAGING_ERR_ARENA_EXHAUSTED:
+                    return self._arena_fallback_outcome(
+                        (chunk,),
+                        direct_transfer,
+                        direct_descriptors,
+                        error=f"P rejected PREPARE_READ for chunk {chunk.chunk_id}: {response.reason}",
+                    )
+                return _WindowOutcome(
+                    error=f"P rejected PREPARE_READ for chunk {chunk.chunk_id}: {response.reason}"
+                )
             if response.payload_bytes != chunk.payload_bytes:
-                self._send_abort(send_ack, transfer_id, chunk.chunk_id)
-                return (
-                    f"P returned wrong payload size for chunk {chunk.chunk_id}: "
-                    f"expected={chunk.payload_bytes}, got={response.payload_bytes}"
+                self._send_abort(send_ack, transfer_id, chunk.chunk_id, response.lease_id)
+                return _WindowOutcome(
+                    error=(
+                        f"P returned wrong payload size for chunk {chunk.chunk_id}: "
+                        f"expected={chunk.payload_bytes}, got={response.payload_bytes}"
+                    )
                 )
 
-            d_slot_addr = self.pool.slot_ptr(slot.slot_id)
+            d_staging_addr = self.allocator.address(lease)
             staging_descriptor = _ReadDescriptor(
-                local_dst=d_slot_addr,
-                remote_src=response.slot_addr,
+                local_dst=d_staging_addr,
+                remote_src=response.staging_addr,
                 nbytes=chunk.payload_bytes,
                 kind="staging",
                 chunk_id=chunk.chunk_id,
             )
             if direct_descriptors:
                 if rdma_read_batch is None:
-                    self._send_abort(send_ack, transfer_id, chunk.chunk_id)
-                    return f"merged RDMA callback unavailable for chunk {chunk.chunk_id}"
+                    self._send_abort(send_ack, transfer_id, chunk.chunk_id, response.lease_id)
+                    return _WindowOutcome(
+                        error=f"merged RDMA callback unavailable for chunk {chunk.chunk_id}"
+                    )
                 descriptors = (*direct_descriptors, staging_descriptor)
                 logger.info(
                     "D merged RDMA batch start: transfer_id=%s direct_entries=%d packed_chunks=1 "
@@ -343,15 +462,27 @@ class DecodeStagingCoordinator:
                     [descriptor.nbytes for descriptor in descriptors],
                 )
             else:
-                ret = rdma_read(d_slot_addr, response.slot_addr, chunk.payload_bytes)
+                ret = rdma_read(d_staging_addr, response.staging_addr, chunk.payload_bytes)
             t_rdma = time.perf_counter()
 
             if ret != 0:
-                self._send_abort(send_ack, transfer_id, chunk.chunk_id)
-                return f"RDMA read failed for chunk {chunk.chunk_id}: ret={ret}"
+                self._send_abort(send_ack, transfer_id, chunk.chunk_id, response.lease_id)
+                return _WindowOutcome(error=f"RDMA read failed for chunk {chunk.chunk_id}: ret={ret}")
+
+            # The P lease protects the remote extent only. Release it before
+            # scatter so arena occupancy does not include the D-side copy.
+            send_ack(
+                ReadAckMsg(
+                    transfer_id=transfer_id,
+                    chunk_id=chunk.chunk_id,
+                    lease_id=response.lease_id,
+                    success=True,
+                )
+            )
+            t_ack = time.perf_counter()
 
             try:
-                staging_view = self.pool.slot_view(slot.slot_id)
+                staging_view = self.allocator.view(lease)
                 scatter_timing: dict[str, float] = {}
                 if self.dst_regions:
                     unpack_from_staging_multi(
@@ -369,7 +500,11 @@ class DecodeStagingCoordinator:
                         timing=scatter_timing,
                     )
             except Exception:
-                self._send_abort(send_ack, transfer_id, chunk.chunk_id)
+                logger.exception(
+                    "D scatter failed after P lease release: transfer=%s chunk=%d",
+                    transfer_id,
+                    chunk.chunk_id,
+                )
                 raise
             t_scatter = time.perf_counter()
 
@@ -400,9 +535,6 @@ class DecodeStagingCoordinator:
                 ),
             )
 
-            send_ack(ReadAckMsg(transfer_id=transfer_id, chunk_id=chunk.chunk_id, success=True))
-            t_ack = time.perf_counter()
-
             p_gather_ms = getattr(response, 'gather_ms', 0.0)
             logger.info(
                 "D chunk timing: transfer=%s chunk=%d bytes=%d | "
@@ -415,9 +547,9 @@ class DecodeStagingCoordinator:
                 (t_prepare - t_acquire) * 1000,
                 p_gather_ms,
                 (t_rdma - t_prepare) * 1000,
-                (t_scatter - t_rdma) * 1000,
-                (t_ack - t_scatter) * 1000,
-                (t_ack - t0) * 1000,
+                (t_scatter - t_ack) * 1000,
+                (t_ack - t_rdma) * 1000,
+                (t_scatter - t0) * 1000,
             )
             logger.info(
                 "D staging window timing: transfer_id=%s chunks=1 entries=%d bytes=%d "
@@ -429,14 +561,19 @@ class DecodeStagingCoordinator:
                 (t_acquire - t0) * 1000,
                 (t_prepare - t_acquire) * 1000,
                 (t_rdma - t_prepare) * 1000,
-                (t_scatter - t_rdma) * 1000,
-                (t_ack - t_scatter) * 1000,
-                (t_ack - t0) * 1000,
+                (t_scatter - t_ack) * 1000,
+                (t_ack - t_rdma) * 1000,
+                (t_scatter - t0) * 1000,
             )
         finally:
-            self.pool.release(slot.slot_id)
+            self.allocator.release(lease)
 
-        return None
+        return _WindowOutcome(
+            packed_bytes=chunk.payload_bytes,
+            packed_entries=len(chunk.scatter_entries),
+            chunks_completed=1,
+            direct_completed=bool(direct_descriptors),
+        )
 
     def _execute_batch(
         self,
@@ -447,27 +584,36 @@ class DecodeStagingCoordinator:
         rdma_read_batch: RdmaReadBatchFn | None,
         send_ack_batch: SendAckBatchFn,
         direct_descriptors: tuple[_ReadDescriptor, ...] = (),
-    ) -> tuple[str | None, int, int, int, bool]:
+        release_source_when_ready: bool = False,
+        expected_packed_chunks: int = 0,
+        direct_transfer: DirectTransferFn | None = None,
+    ) -> "_WindowOutcome":
         """Execute one batch window with one RDMA submission and scatter."""
         t0 = time.perf_counter()
-        slots = []
+        leases: list[StagingLease] = []
         for chunk in chunks:
-            if chunk.payload_bytes > self.pool.slot_capacity:
-                return (
-                    f"chunk {chunk.chunk_id} exceeds D staging slot capacity: "
-                    f"payload={chunk.payload_bytes}, capacity={self.pool.slot_capacity}",
-                    0,
-                    0,
-                    0,
-                    False,
+            if chunk.payload_bytes > self.allocator.capacity_bytes:
+                return self._arena_fallback_outcome(
+                    chunks,
+                    direct_transfer,
+                    direct_descriptors,
+                    error=(
+                        f"chunk {chunk.chunk_id} exceeds D staging arena capacity: "
+                        f"payload={chunk.payload_bytes}, capacity={self.allocator.capacity_bytes}"
+                    ),
                 )
         for chunk in chunks:
-            slot = self.pool.acquire()
-            if slot is None:
-                for acquired in slots:
-                    self.pool.release(acquired.slot_id)
-                return f"no D staging slot for batch window", 0, 0, 0, False
-            slots.append(slot)
+            lease = self.allocator.allocate(chunk.payload_bytes)
+            if lease is None:
+                for acquired in leases:
+                    self.allocator.release(acquired)
+                return self._arena_fallback_outcome(
+                    chunks,
+                    direct_transfer,
+                    direct_descriptors,
+                    error="no contiguous D staging extent for batch window",
+                )
+            leases.append(lease)
         t_acquire = time.perf_counter()
 
         ack_items: list[ReadAckBatchItem] = []
@@ -483,6 +629,11 @@ class DecodeStagingCoordinator:
         ack_ms = 0.0
         scatter_total_ms = 0.0
         direct_completed = False
+        ack_sent = False
+        arena_failed: list[PackedChunk] = []
+        fallback_rest = False
+        fallback_direct_bytes = 0
+        fallback_direct_entries = 0
         try:
             logger.info(
                 "D staging batch prepare start: transfer_id=%s chunks=%d bytes=%d",
@@ -503,6 +654,8 @@ class DecodeStagingCoordinator:
                         )
                         for chunk in chunks
                     ],
+                    release_source_when_ready=release_source_when_ready,
+                    expected_chunks=expected_packed_chunks,
                 )
             )
             t_prepare = time.perf_counter()
@@ -525,8 +678,8 @@ class DecodeStagingCoordinator:
                     sum(item.success for item in response.results),
                     sum(not item.success for item in response.results),
                 )
-                ready_chunks: list[tuple[PackedChunk, Any, Any]] = []
-                for chunk, slot in zip(chunks, slots):
+                ready_chunks: list[tuple[PackedChunk, StagingLease, Any]] = []
+                for chunk, lease in zip(chunks, leases):
                     ready = ready_by_chunk.get(chunk.chunk_id)
                     if ready is None:
                         first_error = f"P returned no result for chunk {chunk.chunk_id}"
@@ -537,6 +690,17 @@ class DecodeStagingCoordinator:
                         )
                         break
                     if not ready.success:
+                        if (
+                            ready.error_code == STAGING_ERR_ARENA_EXHAUSTED
+                            and direct_transfer is not None
+                        ):
+                            arena_failed.append(chunk)
+                            logger.info(
+                                "D staging batch arena exhausted: transfer_id=%s chunk_id=%d",
+                                transfer_id,
+                                chunk.chunk_id,
+                            )
+                            continue
                         first_error = f"P rejected PREPARE_READ for chunk {chunk.chunk_id}: {ready.error}"
                         logger.error(
                             "D staging batch chunk rejected: transfer_id=%s chunk_id=%d code=%d reason=%s",
@@ -558,16 +722,19 @@ class DecodeStagingCoordinator:
                             chunk.payload_bytes,
                             ready.payload_bytes,
                         )
-                        ack_items.append(ReadAckBatchItem(chunk_id=chunk.chunk_id, success=False))
+                        if ready.lease_id:
+                            ack_items.append(
+                                ReadAckBatchItem(chunk_id=chunk.chunk_id, lease_id=ready.lease_id, success=False)
+                            )
                         break
 
-                    ready_chunks.append((chunk, slot, ready))
+                    ready_chunks.append((chunk, lease, ready))
 
                 if first_error is None and ready_chunks:
                     staging_descriptors = [
                         _ReadDescriptor(
-                            local_dst=self.pool.slot_ptr(slot.slot_id),
-                            remote_src=ready.slot_addr,
+                            local_dst=self.allocator.address(slot),
+                            remote_src=ready.staging_addr,
                             nbytes=chunk.payload_bytes,
                             kind="staging",
                             chunk_id=chunk.chunk_id,
@@ -615,10 +782,31 @@ class DecodeStagingCoordinator:
                             len(staging_descriptors),
                             len(lengths),
                         )
+                        for chunk, _, ready in ready_chunks:
+                            ack_items.append(
+                                ReadAckBatchItem(
+                                    chunk_id=chunk.chunk_id,
+                                    lease_id=ready.lease_id,
+                                    success=True,
+                                )
+                            )
+                        if ack_items:
+                            logger.info(
+                                "D staging batch ACK send: transfer_id=%s chunks=%d success=%d failed=%d",
+                                transfer_id,
+                                len(ack_items),
+                                sum(item.success for item in ack_items),
+                                sum(not item.success for item in ack_items),
+                            )
+                            t_ack_start = time.perf_counter()
+                            send_ack_batch(ReadAckBatchMsg(transfer_id=transfer_id, results=ack_items))
+                            t_ack = time.perf_counter()
+                            ack_ms = (t_ack - t_ack_start) * 1000
+                            ack_sent = True
                         scatter_timing: dict[str, float] = {}
                         scatter_start = time.perf_counter()
                         try:
-                            staging_views = [self.pool.slot_view(slot.slot_id) for _, slot, _ in ready_chunks]
+                            staging_views = [self.allocator.view(lease) for _, lease, _ in ready_chunks]
                             scatter_entry_batches = [chunk.scatter_entries for chunk, _, _ in ready_chunks]
                             dst_regions = self.dst_regions or [(self.dst_base_addr, self.dst_tensor)]
                             unpack_from_staging_multi_batch(
@@ -659,29 +847,54 @@ class DecodeStagingCoordinator:
                                 scatter_timing.get("unpack_from_staging_multi_ms", 0.0),
                             ),
                         )
-                        for chunk, _, _ in ready_chunks:
+                        for chunk, _, ready in ready_chunks:
                             scatter_timings[chunk.chunk_id] = (scatter_start, scatter_end)
                             if first_error is not None:
                                 break
-                            ack_items.append(ReadAckBatchItem(chunk_id=chunk.chunk_id, success=True))
                             packed_bytes += chunk.payload_bytes
                             packed_entries += len(chunk.scatter_entries)
                             chunks_completed += 1
 
+                if first_error is None and arena_failed:
+                    extra = () if ready_chunks else direct_descriptors
+                    fallback_error = self._direct_fallback_chunks(
+                        arena_failed, direct_transfer, extra
+                    )
+                    if fallback_error is not None:
+                        first_error = fallback_error
+                    else:
+                        fallback_rest = True
+                        fallback_direct_bytes = sum(chunk.payload_bytes for chunk in arena_failed)
+                        fallback_direct_entries = sum(
+                            len(chunk.gather_entries) for chunk in arena_failed
+                        )
+                        if extra:
+                            direct_completed = True
+
                 if first_error is not None:
                     acked_ids = {item.chunk_id for item in ack_items}
                     for chunk in chunks:
-                        if chunk.chunk_id in ready_by_chunk and chunk.chunk_id not in acked_ids:
-                            ack_items.append(ReadAckBatchItem(chunk_id=chunk.chunk_id, success=False))
+                        ready = ready_by_chunk.get(chunk.chunk_id)
+                        if ready is not None and ready.success and chunk.chunk_id not in acked_ids:
+                            ack_items.append(
+                                ReadAckBatchItem(
+                                    chunk_id=chunk.chunk_id,
+                                    lease_id=ready.lease_id,
+                                    success=False,
+                                )
+                            )
 
             # Release every P-side slot that returned PackReady, including
             # chunks after the first error that were gathered successfully.
-            ready_ids = set(ready_by_chunk)
+            ready_ids = {chunk_id for chunk_id, ready in ready_by_chunk.items() if ready.success}
             acked_ids = {item.chunk_id for item in ack_items}
             for chunk in chunks:
                 if chunk.chunk_id in ready_ids and chunk.chunk_id not in acked_ids:
-                    ack_items.append(ReadAckBatchItem(chunk_id=chunk.chunk_id, success=False))
-            if ack_items:
+                    ready = ready_by_chunk[chunk.chunk_id]
+                    ack_items.append(
+                        ReadAckBatchItem(chunk_id=chunk.chunk_id, lease_id=ready.lease_id, success=False)
+                    )
+            if ack_items and not ack_sent:
                 logger.info(
                     "D staging batch ACK send: transfer_id=%s chunks=%d success=%d failed=%d",
                     transfer_id,
@@ -693,7 +906,7 @@ class DecodeStagingCoordinator:
                 send_ack_batch(ReadAckBatchMsg(transfer_id=transfer_id, results=ack_items))
                 t_ack = time.perf_counter()
                 ack_ms = (t_ack - t_ack_start) * 1000
-
+            if ack_items:
                 ack_by_chunk = {item.chunk_id: item for item in ack_items}
                 for chunk in chunks:
                     ready = ready_by_chunk.get(chunk.chunk_id)
@@ -714,7 +927,7 @@ class DecodeStagingCoordinator:
                         (t_rdma - t_prepare) * 1000,
                         scatter_ms,
                         ack_ms,
-                        (t_ack - t0) * 1000,
+                        (max(t_ack, scatter_end) - t0) * 1000,
                     )
             logger.info(
                 "D staging window timing: transfer_id=%s chunks=%d entries=%d bytes=%d "
@@ -729,24 +942,37 @@ class DecodeStagingCoordinator:
                 (t_rdma - t_prepare) * 1000,
                 scatter_total_ms,
                 ack_ms,
-                (t_ack - t0) * 1000,
+                (time.perf_counter() - t0) * 1000,
                 first_error is None,
             )
-            return first_error, packed_bytes, packed_entries, chunks_completed, direct_completed
+            return _WindowOutcome(
+                error=first_error,
+                packed_bytes=packed_bytes,
+                packed_entries=packed_entries,
+                chunks_completed=chunks_completed,
+                direct_completed=direct_completed,
+                fallback_rest=fallback_rest,
+                direct_bytes=fallback_direct_bytes,
+                direct_entries=fallback_direct_entries,
+            )
         finally:
-            for slot in slots:
-                self.pool.release(slot.slot_id)
+            for lease in leases:
+                self.allocator.release(lease)
 
     @staticmethod
-    def _send_abort(send_ack: SendAckFn, transfer_id: str, chunk_id: int) -> None:
-        """Release the P slot after a D-side RDMA/scatter failure.
+    def _send_abort(send_ack: SendAckFn, transfer_id: str, chunk_id: int, lease_id: int) -> None:
+        """Release the P lease after a D-side RDMA failure.
+
+        Scatter failures do not call this. A successful READ_ACK has already
+        released the P lease, and a second ACK must not be required to finish
+        the D-side copy.
 
         The P service treats both success and abort ACKs as terminal for the
         reserved slot.  A failed control message must not hide the original
         transfer failure, so it is logged and swallowed here.
         """
         try:
-            send_ack(ReadAckMsg(transfer_id=transfer_id, chunk_id=chunk_id, success=False))
+            send_ack(ReadAckMsg(transfer_id=transfer_id, chunk_id=chunk_id, lease_id=lease_id, success=False))
         except Exception:
             logger.exception(
                 "Failed to send abort ACK: transfer=%s chunk=%d",

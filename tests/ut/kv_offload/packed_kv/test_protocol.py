@@ -44,11 +44,15 @@ class TestEncodeDecodeRoundtrip:
                     total_bytes=128,
                 ),
             ],
+            release_source_when_ready=True,
+            expected_chunks=2,
         )
         decoded = decode_msg(encode_msg(msg))
         assert isinstance(decoded, PrepareReadBatchMsg)
         assert decoded.transfer_id == "tx-batch"
         assert [item.chunk_id for item in decoded.chunks] == [0, 1]
+        assert decoded.release_source_when_ready is True
+        assert decoded.expected_chunks == 2
 
     def test_pack_ready_batch_roundtrip(self) -> None:
         msg = PackReadyBatchMsg(
@@ -57,7 +61,8 @@ class TestEncodeDecodeRoundtrip:
                 PackReadyBatchItem(
                     chunk_id=0,
                     success=True,
-                    slot_addr=0x1000,
+                    lease_id=10,
+                    staging_addr=0x1000,
                     payload_bytes=64,
                 ),
                 PackReadyBatchItem(
@@ -70,13 +75,13 @@ class TestEncodeDecodeRoundtrip:
         )
         decoded = decode_msg(encode_msg(msg))
         assert isinstance(decoded, PackReadyBatchMsg)
-        assert decoded.results[0].slot_addr == 0x1000
+        assert decoded.results[0].staging_addr == 0x1000
         assert decoded.results[1].error == "no slot"
 
     def test_read_ack_batch_roundtrip(self) -> None:
         msg = ReadAckBatchMsg(
             transfer_id="tx-ack-batch",
-            results=[ReadAckBatchItem(chunk_id=0), ReadAckBatchItem(chunk_id=1, success=False)],
+            results=[ReadAckBatchItem(chunk_id=0, lease_id=10), ReadAckBatchItem(chunk_id=1, lease_id=11, success=False)],
         )
         decoded = decode_msg(encode_msg(msg))
         assert isinstance(decoded, ReadAckBatchMsg)
@@ -88,6 +93,8 @@ class TestEncodeDecodeRoundtrip:
             chunk_id=0,
             gather_entries=[(100, 0, 64), (200, 64, 128)],
             total_bytes=192,
+            release_source_when_ready=True,
+            expected_chunks=3,
         )
         data = encode_msg(msg)
         decoded = decode_msg(data)
@@ -96,12 +103,15 @@ class TestEncodeDecodeRoundtrip:
         assert decoded.chunk_id == 0
         assert decoded.gather_entries == [(100, 0, 64), (200, 64, 128)]
         assert decoded.total_bytes == 192
+        assert decoded.release_source_when_ready is True
+        assert decoded.expected_chunks == 3
 
     def test_pack_ready_roundtrip(self) -> None:
         msg = PackReadyMsg(
             transfer_id="tx-002",
             chunk_id=3,
-            slot_addr=0xDEADBEEF,
+            lease_id=42,
+            staging_addr=0xDEADBEEF,
             payload_bytes=1024,
         )
         data = encode_msg(msg)
@@ -109,11 +119,12 @@ class TestEncodeDecodeRoundtrip:
         assert isinstance(decoded, PackReadyMsg)
         assert decoded.transfer_id == "tx-002"
         assert decoded.chunk_id == 3
-        assert decoded.slot_addr == 0xDEADBEEF
+        assert decoded.lease_id == 42
+        assert decoded.staging_addr == 0xDEADBEEF
         assert decoded.payload_bytes == 1024
 
     def test_read_ack_roundtrip(self) -> None:
-        msg = ReadAckMsg(transfer_id="tx-003", chunk_id=5)
+        msg = ReadAckMsg(transfer_id="tx-003", chunk_id=5, lease_id=50)
         data = encode_msg(msg)
         decoded = decode_msg(data)
         assert isinstance(decoded, ReadAckMsg)
@@ -122,7 +133,7 @@ class TestEncodeDecodeRoundtrip:
         assert decoded.success is True
 
     def test_failed_read_ack_roundtrip(self) -> None:
-        msg = ReadAckMsg(transfer_id="tx-003-fail", chunk_id=6, success=False)
+        msg = ReadAckMsg(transfer_id="tx-003-fail", chunk_id=6, lease_id=60, success=False)
         decoded = decode_msg(encode_msg(msg))
         assert isinstance(decoded, ReadAckMsg)
         assert decoded.success is False
@@ -131,16 +142,18 @@ class TestEncodeDecodeRoundtrip:
         msg = StagingCapabilityMsg(
             supported=True,
             max_chunk_bytes=16 * 1024 * 1024,
-            num_slots=4,
-            protocol_version=1,
+            arena_capacity_bytes=32 * 1024 * 1024,
+            page_size=256 * 1024,
+            protocol_version=2,
         )
         data = encode_msg(msg)
         decoded = decode_msg(data)
         assert isinstance(decoded, StagingCapabilityMsg)
         assert decoded.supported is True
         assert decoded.max_chunk_bytes == 16 * 1024 * 1024
-        assert decoded.num_slots == 4
-        assert decoded.protocol_version == 1
+        assert decoded.arena_capacity_bytes == 32 * 1024 * 1024
+        assert decoded.page_size == 256 * 1024
+        assert decoded.protocol_version == 2
 
     def test_capability_defaults(self) -> None:
         msg = StagingCapabilityMsg(supported=False)
@@ -149,8 +162,8 @@ class TestEncodeDecodeRoundtrip:
         assert isinstance(decoded, StagingCapabilityMsg)
         assert decoded.supported is False
         assert decoded.max_chunk_bytes == 0
-        assert decoded.num_slots == 0
-        assert decoded.protocol_version == 1
+        assert decoded.arena_capacity_bytes == 0
+        assert decoded.protocol_version == 2
 
     def test_prepare_write_roundtrip(self) -> None:
         msg = PrepareWriteMsg(
@@ -171,7 +184,8 @@ class TestEncodeDecodeRoundtrip:
         msg = WriteReadyMsg(
             transfer_id="tx-w002",
             chunk_id=1,
-            slot_addr=0xCAFEBABE,
+            lease_id=12,
+            staging_addr=0xCAFEBABE,
             payload_bytes=2048,
         )
         data = encode_msg(msg)
@@ -179,11 +193,12 @@ class TestEncodeDecodeRoundtrip:
         assert isinstance(decoded, WriteReadyMsg)
         assert decoded.transfer_id == "tx-w002"
         assert decoded.chunk_id == 1
-        assert decoded.slot_addr == 0xCAFEBABE
+        assert decoded.lease_id == 12
+        assert decoded.staging_addr == 0xCAFEBABE
         assert decoded.payload_bytes == 2048
 
     def test_write_done_roundtrip(self) -> None:
-        msg = WriteDoneMsg(transfer_id="tx-w003", chunk_id=4)
+        msg = WriteDoneMsg(transfer_id="tx-w003", chunk_id=4, lease_id=44)
         data = encode_msg(msg)
         decoded = decode_msg(data)
         assert isinstance(decoded, WriteDoneMsg)
@@ -192,7 +207,7 @@ class TestEncodeDecodeRoundtrip:
         assert decoded.success is True
 
     def test_failed_write_done_roundtrip(self) -> None:
-        msg = WriteDoneMsg(transfer_id="tx-w003-fail", chunk_id=5, success=False)
+        msg = WriteDoneMsg(transfer_id="tx-w003-fail", chunk_id=5, lease_id=55, success=False)
         decoded = decode_msg(encode_msg(msg))
         assert isinstance(decoded, WriteDoneMsg)
         assert decoded.success is False
@@ -223,11 +238,11 @@ class TestMsgTypeOf:
         assert msg_type_of(data) == StagingMsgType.PREPARE_READ
 
     def test_peek_pack_ready(self) -> None:
-        data = encode_msg(PackReadyMsg("t", 0, 0, 0))
+        data = encode_msg(PackReadyMsg("t", 0, 1, 0, 0))
         assert msg_type_of(data) == StagingMsgType.PACK_READY
 
     def test_peek_read_ack(self) -> None:
-        data = encode_msg(ReadAckMsg("t", 0))
+        data = encode_msg(ReadAckMsg("t", 0, 1))
         assert msg_type_of(data) == StagingMsgType.READ_ACK
 
     def test_peek_capability(self) -> None:
@@ -243,11 +258,11 @@ class TestMsgTypeOf:
         assert msg_type_of(data) == StagingMsgType.PREPARE_WRITE
 
     def test_peek_write_ready(self) -> None:
-        data = encode_msg(WriteReadyMsg("t", 0, 0, 0))
+        data = encode_msg(WriteReadyMsg("t", 0, 1, 0, 0))
         assert msg_type_of(data) == StagingMsgType.WRITE_READY
 
     def test_peek_write_done(self) -> None:
-        data = encode_msg(WriteDoneMsg("t", 0))
+        data = encode_msg(WriteDoneMsg("t", 0, 1))
         assert msg_type_of(data) == StagingMsgType.WRITE_DONE
 
 
@@ -288,7 +303,7 @@ class TestErrorHandling:
 
 class TestWireFormat:
     def test_type_prefix_is_single_byte(self) -> None:
-        data = encode_msg(ReadAckMsg("t", 0))
+        data = encode_msg(ReadAckMsg("t", 0, 1))
         assert data[0] == StagingMsgType.READ_ACK
 
     def test_large_gather_entries(self) -> None:
@@ -310,10 +325,11 @@ class TestWireFormat:
         msg = PackReadyMsg(
             transfer_id="addr-test",
             chunk_id=0,
-            slot_addr=addr,
+            lease_id=9,
+            staging_addr=addr,
             payload_bytes=16 * 1024 * 1024,
         )
         data = encode_msg(msg)
         decoded = decode_msg(data)
         assert isinstance(decoded, PackReadyMsg)
-        assert decoded.slot_addr == addr
+        assert decoded.staging_addr == addr

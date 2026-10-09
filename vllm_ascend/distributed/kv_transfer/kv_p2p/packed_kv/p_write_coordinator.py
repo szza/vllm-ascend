@@ -35,7 +35,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
     PackedChunk,
     TransferPlan,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
+from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
     PrepareWriteMsg,
     StagingErrorMsg,
@@ -63,8 +63,8 @@ class PrefillWriteCoordinator:
 
     Parameters
     ----------
-    pool : StagingPool
-        P-side staging pool for gathering fragmented data.
+    allocator : StagingAllocator
+        P-side staging arena for gathering fragmented data.
     src_tensor : torch.Tensor
         Flat view of P-side KV cache.
     src_base_addr : int
@@ -75,15 +75,17 @@ class PrefillWriteCoordinator:
 
     def __init__(
         self,
-        pool: StagingPool,
+        allocator: StagingAllocator,
         src_tensor: torch.Tensor,
         src_base_addr: int,
         src_regions: list[tuple[int, torch.Tensor]] | None = None,
+        chunk_capacity: int | None = None,
     ) -> None:
-        self.pool = pool
+        self.allocator = allocator
         self.src_tensor = src_tensor
         self.src_base_addr = src_base_addr
         self.src_regions = src_regions or []
+        self.chunk_capacity = chunk_capacity or allocator.capacity_bytes
 
     def execute(
         self,
@@ -157,17 +159,17 @@ class PrefillWriteCoordinator:
         send_write_done: SendWriteDoneFn,
     ) -> str | None:
         """Execute one packed chunk via WRITE mode. Returns error string or None."""
-        if chunk.payload_bytes > self.pool.slot_capacity:
+        if chunk.payload_bytes > self.allocator.capacity_bytes:
             return (
-                f"chunk {chunk.chunk_id} exceeds P staging slot capacity: "
-                f"payload={chunk.payload_bytes}, capacity={self.pool.slot_capacity}"
+                f"chunk {chunk.chunk_id} exceeds P staging arena capacity: "
+                f"payload={chunk.payload_bytes}, capacity={self.allocator.capacity_bytes}"
             )
-        slot = self.pool.acquire()
-        if slot is None:
-            return f"no P staging slot for chunk {chunk.chunk_id}"
+        lease = self.allocator.allocate(chunk.payload_bytes)
+        if lease is None:
+            return f"no contiguous P staging extent for chunk {chunk.chunk_id}"
 
         try:
-            staging_view = self.pool.slot_view(slot.slot_id)
+            staging_view = self.allocator.view(lease)
             try:
                 if self.src_regions:
                     pack_into_staging_multi(self.src_regions, staging_view, chunk.gather_entries)
@@ -194,20 +196,25 @@ class PrefillWriteCoordinator:
             if isinstance(response, StagingErrorMsg):
                 return f"D rejected PREPARE_WRITE for chunk {chunk.chunk_id}: {response.reason}"
             if response.payload_bytes != chunk.payload_bytes:
-                self._send_abort(send_write_done, transfer_id, chunk.chunk_id)
+                self._send_abort(send_write_done, transfer_id, chunk.chunk_id, response.lease_id)
                 return (
                     f"D returned wrong payload size for chunk {chunk.chunk_id}: "
                     f"expected={chunk.payload_bytes}, got={response.payload_bytes}"
                 )
 
-            p_slot_addr = self.pool.slot_ptr(slot.slot_id)
-            ret = rdma_write(p_slot_addr, response.slot_addr, chunk.payload_bytes)
+            p_staging_addr = self.allocator.address(lease)
+            ret = rdma_write(p_staging_addr, response.staging_addr, chunk.payload_bytes)
             if ret != 0:
-                self._send_abort(send_write_done, transfer_id, chunk.chunk_id)
+                self._send_abort(send_write_done, transfer_id, chunk.chunk_id, response.lease_id)
                 return f"RDMA write failed for chunk {chunk.chunk_id}: ret={ret}"
 
             send_write_done(
-                WriteDoneMsg(transfer_id=transfer_id, chunk_id=chunk.chunk_id, success=True)
+                WriteDoneMsg(
+                    transfer_id=transfer_id,
+                    chunk_id=chunk.chunk_id,
+                    lease_id=response.lease_id,
+                    success=True,
+                )
             )
 
             logger.debug(
@@ -217,15 +224,17 @@ class PrefillWriteCoordinator:
                 chunk.payload_bytes,
             )
         finally:
-            self.pool.release(slot.slot_id)
+            self.allocator.release(lease)
 
         return None
 
     @staticmethod
-    def _send_abort(send_write_done: SendWriteDoneFn, transfer_id: str, chunk_id: int) -> None:
-        """Notify D of failure so it can release its slot."""
+    def _send_abort(send_write_done: SendWriteDoneFn, transfer_id: str, chunk_id: int, lease_id: int) -> None:
+        """Notify D of failure so it can release its lease."""
         try:
-            send_write_done(WriteDoneMsg(transfer_id=transfer_id, chunk_id=chunk_id, success=False))
+            send_write_done(
+                WriteDoneMsg(transfer_id=transfer_id, chunk_id=chunk_id, lease_id=lease_id, success=False)
+            )
         except Exception:
             logger.exception(
                 "Failed to send abort WRITE_DONE: transfer=%s chunk=%d",

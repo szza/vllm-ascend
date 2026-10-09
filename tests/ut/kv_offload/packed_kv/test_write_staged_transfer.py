@@ -24,7 +24,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.p_write_coordinator im
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
     TransferPlanner,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.pool import StagingPool
+from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
     PrepareWriteMsg,
     StagingErrorMsg,
@@ -33,10 +33,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
 )
 
 
-def _make_rdma_write_fn(p_pool: StagingPool, d_pool: StagingPool):
+def _make_rdma_write_fn(p_pool: StagingAllocator, d_pool: StagingAllocator):
     """Simulated RDMA WRITE: copy from P staging slot to D staging slot."""
-    p_buf = p_pool._pool_view
-    d_buf = d_pool._pool_view
+    p_buf = p_pool.arena_view
+    d_buf = d_pool.arena_view
     p_base = p_pool.base_ptr
     d_base = d_pool.base_ptr
 
@@ -88,17 +88,17 @@ class _WriteFixture:
         self.p_base = self.p_kv.data_ptr()
         self.d_base = self.d_kv.data_ptr()
 
-        self.p_pool = StagingPool(num_slots=num_slots, slot_capacity=slot_capacity, alignment=64, device="cpu")
-        self.d_pool = StagingPool(num_slots=num_slots, slot_capacity=slot_capacity, alignment=64, device="cpu")
+        self.p_pool = StagingAllocator(capacity_bytes=num_slots * slot_capacity, page_size=64, alignment=64, device="cpu")
+        self.d_pool = StagingAllocator(capacity_bytes=num_slots * slot_capacity, page_size=64, alignment=64, device="cpu")
 
         self.p_coordinator = PrefillWriteCoordinator(
-            pool=self.p_pool,
+            allocator=self.p_pool,
             src_tensor=self.p_kv,
             src_base_addr=self.p_base,
         )
 
         self.d_service = DecodeWriteService(
-            pool=self.d_pool,
+            allocator=self.d_pool,
             kv_tensor=self.d_kv,
             kv_base_addr=self.d_base,
         )
@@ -313,7 +313,7 @@ class TestWriteStagedTransfer:
 class TestWriteFailureHandling:
     def test_d_slot_exhausted(self) -> None:
         f = _WriteFixture(num_slots=1)
-        f.d_pool.acquire()
+        f.d_pool.allocate(8192)
 
         src_list = [f.p_base]
         dst_list = [f.d_base]
@@ -337,7 +337,7 @@ class TestWriteFailureHandling:
 
     def test_p_slot_exhausted(self) -> None:
         f = _WriteFixture(num_slots=1)
-        f.p_pool.acquire()
+        f.p_pool.allocate(8192)
 
         src_list = [f.p_base]
         dst_list = [f.d_base]
@@ -357,7 +357,7 @@ class TestWriteFailureHandling:
         )
 
         assert not result.success
-        assert "no P staging slot" in result.error
+        assert "no contiguous P staging extent" in result.error
 
     def test_rdma_write_failure(self) -> None:
         f = _WriteFixture()
@@ -440,7 +440,7 @@ class TestDecodeWriteService:
 
         assert isinstance(r1, WriteReadyMsg)
         assert isinstance(r2, WriteReadyMsg)
-        assert r1.slot_addr == r2.slot_addr
+        assert r1.staging_addr == r2.staging_addr
         assert f.d_service.pending_count == 1
 
     def test_write_done_idempotent(self) -> None:
@@ -451,15 +451,14 @@ class TestDecodeWriteService:
             scatter_entries=[(f.d_base, 0, f.block_len)],
             total_bytes=f.block_len,
         )
-        f.d_service.handle_prepare_write(msg)
-
-        done = WriteDoneMsg(transfer_id="tx-done-idem", chunk_id=0)
+        ready = f.d_service.handle_prepare_write(msg)
+        done = WriteDoneMsg(transfer_id="tx-done-idem", chunk_id=0, lease_id=ready.lease_id)
         assert f.d_service.handle_write_done(done) is True
         assert f.d_service.handle_write_done(done) is False
 
     def test_unknown_write_done(self) -> None:
         f = _WriteFixture()
-        done = WriteDoneMsg(transfer_id="unknown", chunk_id=99)
+        done = WriteDoneMsg(transfer_id="unknown", chunk_id=99, lease_id=1)
         assert f.d_service.handle_write_done(done) is False
 
     def test_prepare_rejects_out_of_range_dest(self) -> None:
@@ -476,7 +475,7 @@ class TestDecodeWriteService:
         assert isinstance(response, StagingErrorMsg)
         assert "outside" in response.reason
         assert f.d_service.pending_count == 0
-        assert f.d_pool.acquire() is not None
+        assert f.d_pool.allocate(8192) is not None
 
     def test_abort_write_done_releases_slot(self) -> None:
         f = _WriteFixture()
@@ -486,14 +485,13 @@ class TestDecodeWriteService:
             scatter_entries=[(f.d_base, 0, f.block_len)],
             total_bytes=f.block_len,
         )
-        f.d_service.handle_prepare_write(msg)
-
-        done = WriteDoneMsg(transfer_id="tx-abort", chunk_id=0, success=False)
+        ready = f.d_service.handle_prepare_write(msg)
+        done = WriteDoneMsg(transfer_id="tx-abort", chunk_id=0, lease_id=ready.lease_id, success=False)
         assert f.d_service.handle_write_done(done) is True
         assert f.d_service.pending_count == 0
-        slot = f.d_pool.acquire()
-        assert slot is not None
-        f.d_pool.release(slot.slot_id)
+        lease = f.d_pool.allocate(8192)
+        assert lease is not None
+        f.d_pool.release(lease)
 
 
 # =====================================================================
@@ -524,18 +522,18 @@ class _MultiRegionWriteFixture:
         self.p_regions = sorted([(t.data_ptr(), t) for t in self.p_tensors], key=lambda r: r[0])
         self.d_regions = sorted([(t.data_ptr(), t) for t in self.d_tensors], key=lambda r: r[0])
 
-        self.p_pool = StagingPool(num_slots=num_slots, slot_capacity=slot_capacity, alignment=64, device="cpu")
-        self.d_pool = StagingPool(num_slots=num_slots, slot_capacity=slot_capacity, alignment=64, device="cpu")
+        self.p_pool = StagingAllocator(capacity_bytes=num_slots * slot_capacity, page_size=64, alignment=64, device="cpu")
+        self.d_pool = StagingAllocator(capacity_bytes=num_slots * slot_capacity, page_size=64, alignment=64, device="cpu")
 
         dummy = torch.empty(0, dtype=torch.int8)
         self.p_coordinator = PrefillWriteCoordinator(
-            pool=self.p_pool,
+            allocator=self.p_pool,
             src_tensor=dummy,
             src_base_addr=0,
             src_regions=self.p_regions,
         )
         self.d_service = DecodeWriteService(
-            pool=self.d_pool,
+            allocator=self.d_pool,
             kv_tensor=dummy,
             kv_base_addr=0,
             kv_regions=self.d_regions,
