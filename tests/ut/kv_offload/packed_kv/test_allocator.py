@@ -56,3 +56,15 @@ def test_stale_and_duplicate_release_are_rejected() -> None:
 def test_constructor_validates_page_size() -> None:
     with pytest.raises(ValueError, match="power of two"):
         StagingAllocator(capacity_bytes=1024, page_size=96, device="cpu")
+
+
+def test_try_allocate_all_rolls_back_when_any_payload_does_not_fit() -> None:
+    allocator = StagingAllocator(capacity_bytes=256, page_size=64, alignment=64, device="cpu")
+    held = allocator.allocate(128)
+    assert held is not None
+    assert allocator.try_allocate_all([64, 128]) is None
+    assert allocator.free_bytes == 128
+    granted = allocator.try_allocate_all([64, 64])
+    assert granted is not None
+    assert len(granted) == 2
+    assert allocator.free_bytes == 0

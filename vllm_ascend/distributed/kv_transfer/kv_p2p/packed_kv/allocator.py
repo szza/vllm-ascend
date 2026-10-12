@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -103,47 +104,70 @@ class StagingAllocator:
         return self._arena
 
     def allocate(self, payload_bytes: int) -> StagingLease | None:
-        if payload_bytes <= 0:
-            raise ValueError(f"payload_bytes must be positive, got {payload_bytes}")
-        page_count = (payload_bytes + self._page_size - 1) // self._page_size
         with self._lock:
-            for index, (start_page, extent_pages) in enumerate(self._free_extents):
-                if extent_pages < page_count:
-                    continue
-                if extent_pages == page_count:
-                    self._free_extents.pop(index)
-                else:
-                    self._free_extents[index] = (start_page + page_count, extent_pages - page_count)
-                lease_id = self._next_lease_id
-                self._next_lease_id += 1
-                lease = StagingLease(
-                    lease_id=lease_id,
-                    offset=start_page * self._page_size,
-                    payload_bytes=payload_bytes,
-                    allocated_bytes=page_count * self._page_size,
-                    page_count=page_count,
-                )
-                self._active[lease_id] = lease
-                return lease
-        return None
+            return self._allocate_locked(payload_bytes)
+
+    def try_allocate_all(self, payload_bytes_list: Sequence[int]) -> list[StagingLease] | None:
+        """Reserve every payload, or reserve nothing.
+
+        The lock is held for the whole attempt so another request cannot take
+        the leftover extent between chunks of this batch.
+        """
+        leases: list[StagingLease] = []
+        with self._lock:
+            for payload_bytes in payload_bytes_list:
+                lease = self._allocate_locked(payload_bytes)
+                if lease is None:
+                    for acquired in leases:
+                        self._release_locked(acquired)
+                    return None
+                leases.append(lease)
+        return leases
 
     def release(self, lease: StagingLease) -> None:
         with self._lock:
-            active = self._active.get(lease.lease_id)
-            if active != lease:
-                raise ValueError(f"Unknown or stale staging lease {lease.lease_id}")
-            del self._active[lease.lease_id]
-            start_page = lease.offset // self._page_size
-            self._free_extents.append((start_page, lease.page_count))
-            self._free_extents.sort()
-            merged: list[tuple[int, int]] = []
-            for extent_start, extent_pages in self._free_extents:
-                if merged and merged[-1][0] + merged[-1][1] == extent_start:
-                    prev_start, prev_pages = merged[-1]
-                    merged[-1] = (prev_start, prev_pages + extent_pages)
-                else:
-                    merged.append((extent_start, extent_pages))
-            self._free_extents = merged
+            self._release_locked(lease)
+
+    def _allocate_locked(self, payload_bytes: int) -> StagingLease | None:
+        if payload_bytes <= 0:
+            raise ValueError(f"payload_bytes must be positive, got {payload_bytes}")
+        page_count = (payload_bytes + self._page_size - 1) // self._page_size
+        for index, (start_page, extent_pages) in enumerate(self._free_extents):
+            if extent_pages < page_count:
+                continue
+            if extent_pages == page_count:
+                self._free_extents.pop(index)
+            else:
+                self._free_extents[index] = (start_page + page_count, extent_pages - page_count)
+            lease_id = self._next_lease_id
+            self._next_lease_id += 1
+            lease = StagingLease(
+                lease_id=lease_id,
+                offset=start_page * self._page_size,
+                payload_bytes=payload_bytes,
+                allocated_bytes=page_count * self._page_size,
+                page_count=page_count,
+            )
+            self._active[lease_id] = lease
+            return lease
+        return None
+
+    def _release_locked(self, lease: StagingLease) -> None:
+        active = self._active.get(lease.lease_id)
+        if active != lease:
+            raise ValueError(f"Unknown or stale staging lease {lease.lease_id}")
+        del self._active[lease.lease_id]
+        start_page = lease.offset // self._page_size
+        self._free_extents.append((start_page, lease.page_count))
+        self._free_extents.sort()
+        merged: list[tuple[int, int]] = []
+        for extent_start, extent_pages in self._free_extents:
+            if merged and merged[-1][0] + merged[-1][1] == extent_start:
+                prev_start, prev_pages = merged[-1]
+                merged[-1] = (prev_start, prev_pages + extent_pages)
+            else:
+                merged.append((extent_start, extent_pages))
+        self._free_extents = merged
 
     def address(self, lease: StagingLease) -> int:
         self._validate_active(lease)

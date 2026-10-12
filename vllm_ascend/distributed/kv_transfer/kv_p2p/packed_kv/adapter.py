@@ -10,7 +10,7 @@ Two entry points:
 
 * ``staged_transfer`` — end-to-end helper: take a ``TransferPlan``,
   execute direct runs via the TE, and for packed chunks do the full
-  PREPARE_READ → PACK_READY → READ → SCATTER → ACK cycle.
+  PREPARE_READ_BATCH → PACK_READY_BATCH → READ → SCATTER → ACK cycle.
   (Batch 4c/4d; currently only the span conversion is implemented.)
 """
 

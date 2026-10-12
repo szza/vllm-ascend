@@ -292,9 +292,9 @@ class KVCacheTaskTracker:
 class _PendingStagingGather:
     """Gather futures owned by the ROUTER listener.
 
-    A batch request is represented by one future per chunk.  The listener
-    keeps the request identity and reconstructs the batch response after all
-    futures finish, so the executor never submits work to itself.
+    A batch request is one future.  The listener keeps the request identity
+    and sends the batch response after that future finishes, so gather does
+    not run on the ROUTER thread.
     """
 
     identity: bytes
@@ -347,8 +347,10 @@ class KVCacheSendingThread(threading.Thread):
             # the same device as the P-side staging pool; CPU pools do not need
             # an initializer.
             staging_device = staging_service.allocator.device
+            # One batch is one gather task. The pool overlaps requests, not
+            # chunks inside a window; those share this single device thread.
             executor_kwargs: dict[str, Any] = {
-                "max_workers": staging_service.max_concurrent_chunks,
+                "max_workers": 1,
                 "thread_name_prefix": "staging-gather",
             }
             if getattr(staging_device, "type", None) == "npu":
@@ -357,7 +359,7 @@ class KVCacheSendingThread(threading.Thread):
             self._staging_executor = concurrent.futures.ThreadPoolExecutor(**executor_kwargs)
             logger.info(
                 "P staging gather executor initialized: workers=%d device=%s",
-                staging_service.max_concurrent_chunks,
+                1,
                 staging_device,
             )
         self._staging_futures: list[_PendingStagingGather] = []
@@ -560,51 +562,34 @@ class KVCacheSendingThread(threading.Thread):
             return False
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
             PrepareReadBatchMsg,
-            PrepareReadMsg,
             StagingMsgType,
             decode_msg,
             msg_type_of,
         )
 
-        msg_type = msg_type_of(payload)
-        if msg_type not in (StagingMsgType.PREPARE_READ, StagingMsgType.PREPARE_READ_BATCH):
+        try:
+            msg_type = msg_type_of(payload)
+        except ValueError:
+            return False
+        if msg_type != StagingMsgType.PREPARE_READ_BATCH:
             return False
         msg = decode_msg(payload)
         decoded_at = time.perf_counter()
         submit_started_at = time.perf_counter()
-        future_start_at = [0.0] * (len(msg.chunks) if isinstance(msg, PrepareReadBatchMsg) else 1)
-        handler_elapsed_ms = [0.0] * len(future_start_at)
+        future_start_at = [0.0]
+        handler_elapsed_ms = [0.0]
 
-        def run_gather(index: int, prepare_msg: PrepareReadMsg):
-            future_start_at[index] = time.perf_counter()
+        def run_gather():
+            future_start_at[0] = time.perf_counter()
             handler_started_at = time.perf_counter()
             try:
-                return self.staging_service.handle_prepare_read(prepare_msg)
+                if not isinstance(msg, PrepareReadBatchMsg):
+                    raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
+                return self.staging_service.handle_prepare_read_batch(msg)
             finally:
-                handler_elapsed_ms[index] = (time.perf_counter() - handler_started_at) * 1000
+                handler_elapsed_ms[0] = (time.perf_counter() - handler_started_at) * 1000
 
-        if msg_type == StagingMsgType.PREPARE_READ:
-            if not isinstance(msg, PrepareReadMsg):
-                raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
-            futures = [self._staging_executor.submit(run_gather, 0, msg)]
-        else:
-            if not isinstance(msg, PrepareReadBatchMsg):
-                raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
-            futures = [
-                self._staging_executor.submit(
-                    run_gather,
-                    index,
-                    PrepareReadMsg(
-                        transfer_id=msg.transfer_id,
-                        chunk_id=item.chunk_id,
-                        gather_entries=item.gather_entries,
-                        total_bytes=item.total_bytes,
-                        release_source_when_ready=msg.release_source_when_ready,
-                        expected_chunks=msg.expected_chunks,
-                    ),
-                )
-                for index, item in enumerate(msg.chunks)
-            ]
+        futures = [self._staging_executor.submit(run_gather)]
         # Start the interval before the first submit.  A worker can begin
         # running before ``submit`` returns, so recording this timestamp after
         # all submits would produce negative queue times.
@@ -621,7 +606,7 @@ class KVCacheSendingThread(threading.Thread):
             "poll_wait_ms=%.2f listener_to_submit_ms=%.2f executor_submit_ms=%.2f",
             msg.transfer_id,
             msg_type.name,
-            len(msg.chunks) if isinstance(msg, PrepareReadBatchMsg) else 1,
+            len(msg.chunks),
             len(self._staging_futures) + 1,
             poll_wait_ms,
             (submit_started_at - listener_received_at) * 1000 if listener_received_at is not None else 0.0,
@@ -667,10 +652,7 @@ class KVCacheSendingThread(threading.Thread):
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
             PackReadyBatchItem,
             PackReadyBatchMsg,
-            PackReadyMsg,
             PrepareReadBatchMsg,
-            PrepareReadMsg,
-            StagingErrorMsg,
             encode_msg,
         )
 
@@ -698,126 +680,59 @@ class KVCacheSendingThread(threading.Thread):
                     post_poll_to_drain_ms = (drain_started_at - poll_end) * 1000
             try:
                 responses: list[Any] = []
-                for index, future in enumerate(gather.futures):
+                for future in gather.futures:
                     try:
-                        result = future.result()
-                        responses.append(result)
-                        if isinstance(gather.request, PrepareReadBatchMsg):
-                            item = gather.request.chunks[index]
-                            logger.info(
-                                "P staging gather completed: transfer_id=%s chunk_id=%d success=%s "
-                                "staging_addr=%s lease_id=%s payload_bytes=%s gather_ms=%.2f",
-                                gather.request.transfer_id,
-                                item.chunk_id,
-                                isinstance(result, PackReadyMsg),
-                                f"0x{result.staging_addr:x}" if isinstance(result, PackReadyMsg) else "-",
-                                result.lease_id if isinstance(result, PackReadyMsg) else "-",
-                                result.payload_bytes if isinstance(result, PackReadyMsg) else 0,
-                                result.gather_ms if isinstance(result, PackReadyMsg) else 0.0,
-                            )
+                        responses.append(future.result())
                     except Exception as exc:
-                        chunk_id = (
-                            gather.request.chunks[index].chunk_id
-                            if isinstance(gather.request, PrepareReadBatchMsg)
-                            else gather.request.chunk_id
-                        )
                         logger.exception(
-                            "P staging gather failed: transfer_id=%s chunk_id=%d",
+                            "P staging gather failed: transfer_id=%s",
                             gather.request.transfer_id,
-                            chunk_id,
                         )
                         responses.append(exc)
 
-                chunk_ids = (
-                    [item.chunk_id for item in gather.request.chunks]
-                    if isinstance(gather.request, PrepareReadBatchMsg)
-                    else [gather.request.chunk_id]
+                task_started_at = gather.future_start_at[0] if gather.future_start_at else 0.0
+                task_done_at = gather.future_done_at[0] if gather.future_done_at else 0.0
+                logger.info(
+                    "P staging future timing: transfer_id=%s chunks=%d "
+                    "submit_to_start_ms=%.2f task_run_ms=%.2f done_to_drain_ms=%.2f "
+                    "last_poll_block_ms=%.2f post_poll_to_drain_ms=%.2f",
+                    gather.request.transfer_id,
+                    len(gather.request.chunks) if isinstance(gather.request, PrepareReadBatchMsg) else 1,
+                    (task_started_at - gather.submitted_at) * 1000 if task_started_at else 0.0,
+                    (task_done_at - task_started_at) * 1000 if task_started_at and task_done_at else 0.0,
+                    (drain_started_at - task_done_at) * 1000 if task_done_at else 0.0,
+                    poll_block_ms,
+                    post_poll_to_drain_ms,
                 )
-                for index, chunk_id in enumerate(chunk_ids):
-                    task_started_at = gather.future_start_at[index]
-                    task_done_at = gather.future_done_at[index]
-                    logger.info(
-                        "P staging future timing: transfer_id=%s chunk_id=%d "
-                        "submit_to_start_ms=%.2f task_run_ms=%.2f done_to_drain_ms=%.2f "
-                        "last_poll_block_ms=%.2f post_poll_to_drain_ms=%.2f",
-                        gather.request.transfer_id,
-                        chunk_id,
-                        (task_started_at - gather.submitted_at) * 1000 if task_started_at else 0.0,
-                        (task_done_at - task_started_at) * 1000 if task_started_at and task_done_at else 0.0,
-                        (drain_started_at - task_done_at) * 1000 if task_done_at else 0.0,
-                        poll_block_ms,
-                        post_poll_to_drain_ms,
-                    )
 
+                result = responses[0] if responses else None
                 if isinstance(gather.request, PrepareReadBatchMsg):
-                    results: list[PackReadyBatchItem] = []
-                    for item, response in zip(gather.request.chunks, responses):
-                        if isinstance(response, StagingErrorMsg):
-                            results.append(
-                                PackReadyBatchItem(
-                                    chunk_id=item.chunk_id,
-                                    success=False,
-                                    error_code=response.code,
-                                    error=response.reason,
-                                )
-                            )
-                        elif isinstance(response, Exception):
-                            results.append(
-                                PackReadyBatchItem(
-                                    chunk_id=item.chunk_id,
-                                    success=False,
-                                    error_code=4,
-                                    error=f"gather failed: {response}",
-                                )
-                            )
-                        elif isinstance(response, PackReadyMsg):
-                            results.append(
-                                PackReadyBatchItem(
-                                    chunk_id=item.chunk_id,
-                                    success=True,
-                                    lease_id=response.lease_id,
-                                    staging_addr=response.staging_addr,
-                                    payload_bytes=response.payload_bytes,
-                                    gather_ms=response.gather_ms,
-                                )
-                            )
-                        else:
-                            results.append(
+                    if isinstance(result, PackReadyBatchMsg):
+                        response = result
+                    else:
+                        reason = (
+                            f"gather failed: {result}"
+                            if isinstance(result, Exception)
+                            else f"unexpected gather response: {type(result).__name__}"
+                        )
+                        response = PackReadyBatchMsg(
+                            transfer_id=gather.request.transfer_id,
+                            results=[
                                 PackReadyBatchItem(
                                     chunk_id=item.chunk_id,
                                     success=False,
                                     error_code=4,
-                                    error=f"unexpected gather response: {type(response).__name__}",
+                                    error=reason,
                                 )
-                            )
-                    response = PackReadyBatchMsg(transfer_id=gather.request.transfer_id, results=results)
+                                for item in gather.request.chunks
+                            ],
+                        )
                     logger.info(
                         "P staging batch ready: transfer_id=%s chunks=%d success=%d failed=%d",
                         gather.request.transfer_id,
-                        len(results),
-                        sum(item.success for item in results),
-                        sum(not item.success for item in results),
-                    )
-                elif isinstance(gather.request, PrepareReadMsg):
-                    response = responses[0]
-                    if isinstance(response, Exception) or not isinstance(
-                        response, (PackReadyMsg, StagingErrorMsg)
-                    ):
-                        response = StagingErrorMsg(
-                            transfer_id=gather.request.transfer_id,
-                            chunk_id=gather.request.chunk_id,
-                            code=4,
-                            reason=(
-                                f"gather failed: {response}"
-                                if isinstance(response, Exception)
-                                else f"unexpected gather response: {type(response).__name__}"
-                            ),
-                        )
-                    logger.info(
-                        "P staging ready: transfer_id=%s chunk_id=%d success=%s",
-                        gather.request.transfer_id,
-                        gather.request.chunk_id,
-                        isinstance(response, PackReadyMsg),
+                        len(response.results),
+                        sum(item.success for item in response.results),
+                        sum(not item.success for item in response.results),
                     )
                 response_encode_started_at = time.perf_counter()
                 response_payload = encode_msg(response)
@@ -869,11 +784,11 @@ class KVCacheSendingThread(threading.Thread):
                     * 1000,
                     max(
                         (
-                            getattr(result, "gather_ms", 0.0)
-                            for result in responses
-                            if isinstance(result, PackReadyMsg)
+                            item.gather_ms
+                            for item in response.results
+                            if isinstance(response, PackReadyBatchMsg)
                         ),
-                        default=0.0,
+                        default=getattr(response, "gather_ms", 0.0),
                     ),
                     max(gather.handler_elapsed_ms, default=0.0),
                     future_done_to_drain_ms,
@@ -897,7 +812,6 @@ class KVCacheSendingThread(threading.Thread):
     def _handle_staging_msg(self, sock: zmq.Socket, identity: bytes, payload: bytes) -> None:
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
             PrepareReadBatchMsg,
-            PrepareReadMsg,
             ReadAckBatchMsg,
             ReadAckMsg,
             StagingMsgType,
@@ -911,29 +825,17 @@ class KVCacheSendingThread(threading.Thread):
             sock.send_multipart((identity, b"", b"ERR_NO_STAGING"))
             return
 
-        msg_type = msg_type_of(payload)
-        if msg_type == StagingMsgType.PREPARE_READ:
-            msg = decode_msg(payload)
-            if not isinstance(msg, PrepareReadMsg):
-                raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
-            sock.send_multipart((identity, b"", encode_msg(self.staging_service.handle_prepare_read(msg))))
-        elif msg_type == StagingMsgType.PREPARE_READ_BATCH:
+        try:
+            msg_type = msg_type_of(payload)
+        except ValueError:
+            logger.error("Unexpected staging message type byte")
+            sock.send_multipart((identity, b"", b"ERR_UNKNOWN_TYPE"))
+            return
+        if msg_type == StagingMsgType.PREPARE_READ_BATCH:
             msg = decode_msg(payload)
             if not isinstance(msg, PrepareReadBatchMsg):
                 raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
             sock.send_multipart((identity, b"", encode_msg(self.staging_service.handle_prepare_read_batch(msg))))
-        elif msg_type == StagingMsgType.READ_ACK:
-            msg = decode_msg(payload)
-            if not isinstance(msg, ReadAckMsg):
-                raise ValueError(f"Unexpected staging message: {type(msg).__name__}")
-            logger.info(
-                "P staging ACK received: transfer_id=%s chunk_id=%d success=%s",
-                msg.transfer_id,
-                msg.chunk_id,
-                msg.success,
-            )
-            self.staging_service.handle_read_ack(msg)
-            sock.send_multipart((identity, b"", b"ACK"))
         elif msg_type == StagingMsgType.READ_ACK_BATCH:
             msg = decode_msg(payload)
             if not isinstance(msg, ReadAckBatchMsg):
@@ -1656,17 +1558,6 @@ class KVCacheRecvingThread(threading.Thread):
                 len(length_list),
             )
 
-        req_end_time = time.perf_counter()
-        req_transfer_elapsed = (req_end_time - req_start_time) * 1000
-        logger.info(
-            "KV cache transfer for request %s took %.2f ms. local_ip %s local_device_id %s remote_session_id %s",
-            remote_request_id,
-            req_transfer_elapsed,
-            get_ip(),
-            self.tp_rank,
-            session_id,
-        )
-
         ready_attention_group_reformat_block_ids = []
         for reformat_group, is_group_transfer_end in attention_group_reformat_block_ids:
             if is_group_transfer_end:
@@ -1785,16 +1676,10 @@ class KVCacheRecvingThread(threading.Thread):
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.adapter import plan_from_flat_entries
         from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
             PackReadyBatchMsg,
-            PackReadyMsg,
             PrepareReadBatchMsg,
-            PrepareReadMsg,
             ReadAckBatchMsg,
-            ReadAckMsg,
-            StagingErrorMsg,
-            StagingMsgType,
             decode_msg,
             encode_msg,
-            msg_type_of,
         )
 
         remote_request_id = req_meta["remote_request_id"]
@@ -1884,63 +1769,6 @@ class KVCacheRecvingThread(threading.Thread):
                     ret,
                 )
             return ret
-
-        def prepare_read(msg: PrepareReadMsg):
-            rpc_started_at = time.perf_counter()
-            socket_get_ms = encode_ms = zmq_send_ms = zmq_recv_wait_ms = decode_ms = socket_return_ms = 0.0
-            sock = None
-            logger.info(
-                "D-side PREPARE_READ: transfer_id=%s, chunk_id=%d, total_bytes=%d",
-                msg.transfer_id, msg.chunk_id, msg.total_bytes,
-            )
-            socket_started_at = time.perf_counter()
-            sock = self._get_remote_socket(remote_host, remote_handshake_port)
-            socket_get_ms = (time.perf_counter() - socket_started_at) * 1000
-            try:
-                encode_started_at = time.perf_counter()
-                payload = self.encoder.encode((STAGING_MSG, encode_msg(msg)))
-                encode_ms = (time.perf_counter() - encode_started_at) * 1000
-                send_started_at = time.perf_counter()
-                ensure_zmq_send(sock, payload, f"{remote_host}:{remote_handshake_port}")
-                zmq_send_ms = (time.perf_counter() - send_started_at) * 1000
-                recv_started_at = time.perf_counter()
-                response = ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
-                zmq_recv_wait_ms = (time.perf_counter() - recv_started_at) * 1000
-                if response == b"ERR_NO_STAGING":
-                    return StagingErrorMsg(msg.transfer_id, msg.chunk_id, 2, "peer has no staging")
-                decode_started_at = time.perf_counter()
-                decoded = decode_msg(response)
-                decode_ms = (time.perf_counter() - decode_started_at) * 1000
-                if msg_type_of(response) == StagingMsgType.ERROR:
-                    if not isinstance(decoded, StagingErrorMsg):
-                        raise ValueError(f"Unexpected staging error: {type(decoded).__name__}")
-                    return decoded
-                if not isinstance(decoded, PackReadyMsg):
-                    raise ValueError(f"Unexpected staging response: {type(decoded).__name__}")
-                logger.info(
-                    "D-side PACK_READY: transfer_id=%s, chunk_id=%d, lease_id=%d, staging_addr=0x%x",
-                    decoded.transfer_id, decoded.chunk_id, decoded.lease_id, decoded.staging_addr,
-                )
-                return decoded
-            finally:
-                if sock is not None:
-                    return_started_at = time.perf_counter()
-                    self._return_remote_socket(sock, remote_host, remote_handshake_port)
-                    socket_return_ms = (time.perf_counter() - return_started_at) * 1000
-                logger.info(
-                    "D PREPARE control timing: transfer_id=%s kind=single chunk_id=%d "
-                    "socket_get_ms=%.2f encode_ms=%.2f zmq_send_ms=%.2f zmq_recv_wait_ms=%.2f "
-                    "decode_ms=%.2f socket_return_ms=%.2f total_ms=%.2f",
-                    msg.transfer_id,
-                    msg.chunk_id,
-                    socket_get_ms,
-                    encode_ms,
-                    zmq_send_ms,
-                    zmq_recv_wait_ms,
-                    decode_ms,
-                    socket_return_ms,
-                    (time.perf_counter() - rpc_started_at) * 1000,
-                )
 
         def prepare_read_batch(msg: PrepareReadBatchMsg):
             rpc_started_at = time.perf_counter()
@@ -2043,47 +1871,6 @@ class KVCacheRecvingThread(threading.Thread):
             )
             return ret
 
-        def send_ack(msg: ReadAckMsg) -> None:
-            rpc_started_at = time.perf_counter()
-            socket_get_ms = encode_ms = zmq_send_ms = zmq_recv_wait_ms = decode_ms = socket_return_ms = 0.0
-            sock = None
-            logger.info(
-                "D-side READ_ACK: transfer_id=%s, chunk_id=%d, success=%s",
-                msg.transfer_id, msg.chunk_id, msg.success,
-            )
-            socket_started_at = time.perf_counter()
-            sock = self._get_remote_socket(remote_host, remote_handshake_port)
-            socket_get_ms = (time.perf_counter() - socket_started_at) * 1000
-            try:
-                encode_started_at = time.perf_counter()
-                payload = self.encoder.encode((STAGING_MSG, encode_msg(msg)))
-                encode_ms = (time.perf_counter() - encode_started_at) * 1000
-                send_started_at = time.perf_counter()
-                ensure_zmq_send(sock, payload, f"{remote_host}:{remote_handshake_port}")
-                zmq_send_ms = (time.perf_counter() - send_started_at) * 1000
-                recv_started_at = time.perf_counter()
-                ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
-                zmq_recv_wait_ms = (time.perf_counter() - recv_started_at) * 1000
-            finally:
-                if sock is not None:
-                    return_started_at = time.perf_counter()
-                    self._return_remote_socket(sock, remote_host, remote_handshake_port)
-                    socket_return_ms = (time.perf_counter() - return_started_at) * 1000
-                logger.info(
-                    "D ACK control timing: transfer_id=%s kind=single chunk_id=%d "
-                    "socket_get_ms=%.2f encode_ms=%.2f zmq_send_ms=%.2f zmq_recv_wait_ms=%.2f "
-                    "decode_ms=%.2f socket_return_ms=%.2f total_ms=%.2f",
-                    msg.transfer_id,
-                    msg.chunk_id,
-                    socket_get_ms,
-                    encode_ms,
-                    zmq_send_ms,
-                    zmq_recv_wait_ms,
-                    decode_ms,
-                    socket_return_ms,
-                    (time.perf_counter() - rpc_started_at) * 1000,
-                )
-
         def send_ack_batch(msg: ReadAckBatchMsg) -> None:
             rpc_started_at = time.perf_counter()
             socket_get_ms = encode_ms = zmq_send_ms = zmq_recv_wait_ms = decode_ms = socket_return_ms = 0.0
@@ -2136,9 +1923,7 @@ class KVCacheRecvingThread(threading.Thread):
             plan,
             transfer_id=remote_request_id,
             direct_transfer=direct_transfer,
-            prepare_read=prepare_read,
             rdma_read=rdma_read,
-            send_ack=send_ack,
             prepare_read_batch=prepare_read_batch,
             send_ack_batch=send_ack_batch,
             rdma_read_batch=rdma_read_batch,
@@ -2148,17 +1933,12 @@ class KVCacheRecvingThread(threading.Thread):
             expected_packed_chunks=expected_packed_chunks,
         )
         staging_executor_ms = (time.perf_counter() - staging_started_at) * 1000
-        # Keep direct, merged RDMA, and staging orchestration time separate so
-        # the transfer summary does not double-count the merged data phase.
+        # direct_ms and merged_rdma_ms are already inside the executor wall.
+        # Log only the remainder so the summary does not print the same number twice.
         staging_elapsed_ms = max(0.0, staging_executor_ms - direct_elapsed_ms - merged_rdma_elapsed_ms)
         logger.info(
-            "Staging transfer done: transfer_id=%s, success=%s",
-            remote_request_id, result.success,
-        )
-        logger.info(
             "D transfer summary: transfer_id=%s metadata_ms=%.2f metadata_to_plan_ms=%.2f "
-            "plan_ms=%.2f direct_ms=%.2f merged_rdma_ms=%.2f staging_ms=%.2f "
-            "staging_executor_ms=%.2f total_ms=%.2f "
+            "plan_ms=%.2f direct_ms=%.2f merged_rdma_ms=%.2f staging_ms=%.2f total_ms=%.2f "
             "direct_bytes=%d direct_entries=%d packed_bytes=%d packed_entries=%d packed_chunks=%d success=%s",
             remote_request_id,
             metadata_ms,
@@ -2167,7 +1947,6 @@ class KVCacheRecvingThread(threading.Thread):
             direct_elapsed_ms,
             merged_rdma_elapsed_ms,
             staging_elapsed_ms,
-            staging_executor_ms,
             (time.perf_counter() - transfer_started_at) * 1000,
             result.direct_bytes,
             result.direct_entries,
@@ -2697,8 +2476,13 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         pass
 
     def wait_for_save(self):
-        """MooncakeConnector does not save explicitly."""
-        pass
+        """Record that this step's KV writes are ordered on the model stream.
+
+        Gather waits on this event instead of the live model stream, so a
+        later request's compute cannot stall the copy.
+        """
+        if self.connector_worker is not None:
+            self.connector_worker.record_staging_kv_ready()
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """
@@ -3657,6 +3441,24 @@ class MooncakeConnectorWorker:
             )
             logger.info("D-side staging enabled: arena=%d bytes page=%d bytes device=%s", config.arena_capacity, config.page_size, device)
         return (component, None) if self.kv_role == "kv_producer" else (None, component)
+
+    def record_staging_kv_ready(self) -> None:
+        """Record a model-stream event for the next staging gather."""
+        thread = getattr(self, "kv_send_thread", None)
+        service = getattr(thread, "staging_service", None) if thread is not None else None
+        if service is None or not hasattr(service, "record_kv_ready"):
+            return
+        npu = getattr(torch, "npu", None)
+        if npu is None or not hasattr(npu, "Event") or not hasattr(npu, "current_stream"):
+            return
+        try:
+            stream = npu.current_stream()
+            event = npu.Event()
+            event.record(stream)
+        except Exception:
+            logger.debug("Failed to record staging KV ready event", exc_info=True)
+            return
+        service.record_kv_ready(event)
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_sending = (

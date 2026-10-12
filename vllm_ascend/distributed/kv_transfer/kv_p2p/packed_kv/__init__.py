@@ -47,7 +47,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
     PackReadyBatchItem,
     PackReadyBatchMsg,
-    PackReadyMsg,
     PrepareReadBatchItem,
     PrepareReadBatchMsg,
     PrepareReadMsg,
@@ -71,7 +70,6 @@ __all__ = [
     "DecodeWriteService",
     "DirectRun",
     "GatherEntry",
-    "PackReadyMsg",
     "PackReadyBatchItem",
     "PackReadyBatchMsg",
     "PackedChunk",

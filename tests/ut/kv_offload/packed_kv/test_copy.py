@@ -15,6 +15,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.copy import (
     execute_plan_on_tensors_multi,
     pack_into_staging,
     pack_into_staging_multi,
+    pack_into_staging_multi_batch,
     unpack_from_staging,
     unpack_from_staging_multi,
 )
@@ -356,6 +357,20 @@ class TestPackMulti:
         staging = torch.full((16,), 99, dtype=torch.int8)
         pack_into_staging_multi([(t0.data_ptr(), t0)], staging, [])
         assert all(v == 99 for v in staging.tolist())
+
+
+    def test_batch_matches_separate_packs(self) -> None:
+        src = torch.arange(64, dtype=torch.int8)
+        regions = [(src.data_ptr(), src)]
+        first = torch.zeros(8, dtype=torch.int8)
+        second = torch.zeros(8, dtype=torch.int8)
+        first_entries = [GatherEntry(src_offset=src.data_ptr() + 1, packed_offset=0, nbytes=4)]
+        second_entries = [GatherEntry(src_offset=src.data_ptr() + 10, packed_offset=0, nbytes=4)]
+        pack_into_staging_multi_batch(regions, [first, second], [first_entries, second_entries])
+        assert first[:4].tolist() == [1, 2, 3, 4]
+        assert second[:4].tolist() == [10, 11, 12, 13]
+        assert all(v == 0 for v in first[4:].tolist())
+        assert all(v == 0 for v in second[4:].tolist())
 
 
 # =====================================================================

@@ -81,8 +81,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
 )
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (  # noqa: E402
+    PackReadyBatchItem,
     PackReadyBatchMsg,
-    PackReadyMsg,
     PrepareReadBatchItem,
     PrepareReadBatchMsg,
     decode_msg,
@@ -287,17 +287,20 @@ class TestKVCacheSendingThread(unittest.TestCase):
             max_concurrent_chunks = 2
 
             @staticmethod
-            def handle_prepare_read(msg):
-                # Complete chunk 1 first to verify aggregation does not use
-                # completion order as the batch order.
-                time.sleep(0.02 if msg.chunk_id == 0 else 0.001)
-                return PackReadyMsg(
+            def handle_prepare_read_batch(msg):
+                return PackReadyBatchMsg(
                     transfer_id=msg.transfer_id,
-                    chunk_id=msg.chunk_id,
-                    lease_id=100 + msg.chunk_id,
-                    staging_addr=0x1000 + msg.chunk_id,
-                    payload_bytes=msg.total_bytes,
-                    gather_ms=1.0,
+                    results=[
+                        PackReadyBatchItem(
+                            chunk_id=item.chunk_id,
+                            success=True,
+                            lease_id=100 + item.chunk_id,
+                            staging_addr=0x1000 + item.chunk_id,
+                            payload_bytes=item.total_bytes,
+                            gather_ms=1.0,
+                        )
+                        for item in msg.chunks
+                    ],
                 )
 
         thread = KVCacheSendingThread(
@@ -3253,24 +3256,6 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         worker.pcp_size = 1
         worker.dcp_size = 2
         worker.block_size = 16
-        meta = types.SimpleNamespace(
-            remote_pcp_size=1,
-            remote_dcp_size=2,
-            remote_block_ids=([10, 11],),
-            local_block_ids=([20],),
-            local_full_block_ids=tuple(),
-            num_external_tokens=32,
-            num_prompt_blocks=3,
-            num_computed_tokens=16,
-        )
-
-        with self.assertRaises(AssertionError):
-            worker._get_sfa_replicate_k_block_ids(cast(ReqMeta, meta))
-
-
-if __name__ == "__main__":
-    unittest.main()
-lock_size = 16
         meta = types.SimpleNamespace(
             remote_pcp_size=1,
             remote_dcp_size=2,

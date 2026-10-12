@@ -19,21 +19,23 @@ sequenceDiagram
     participant PA as P StagingAllocator
     participant BP as P scheduler / BlockPool
 
-    D->>D: Plan chunk and compute payload_bytes
-    D->>DA: allocate(payload_bytes)
-    DA-->>D: D lease and local destination address
-    D->>P: PREPARE_READ(total_bytes, gather_entries)
-    P->>PA: allocate(total_bytes)
-    PA-->>P: P lease and contiguous extent
-    P->>P: Gather KV fragments into extent
+    D->>D: Plan window and compute payload_bytes
+    D->>DA: allocate(payload_bytes) for each chunk
+    DA-->>D: D leases and local destination addresses
+    D->>P: PREPARE_READ_BATCH(chunks)
+    P->>PA: allocate(total_bytes) per chunk
+    PA-->>P: P leases and contiguous extents
+    P->>P: Gather KV fragments into extents
     P->>P: Wait for gather/copy completion
-    P-->>D: PACK_READY(address, payload_bytes, lease_id)
-    D->>D: RDMA read from P extent into D extent
+    P-->>D: PACK_READY_BATCH(results)
+    D->>D: RDMA read from P extents into D extents
+    D->>P: READ_ACK_BATCH(results)
+    P->>PA: Release matching leases
     D->>D: Scatter packed bytes into D KV cache
-    D->>P: READ_ACK(transfer_id, chunk_id, lease_id)
-    P->>PA: Release matching lease
-    D->>DA: Release local lease after scatter
+    D->>DA: Release local leases after scatter
 ```
+
+A one-chunk window uses the same batch messages with a single item.
 
 For WRITE mode, P gathers into a local extent, asks D to allocate its
 destination extent, performs RDMA WRITE, then sends `WRITE_DONE` with D's

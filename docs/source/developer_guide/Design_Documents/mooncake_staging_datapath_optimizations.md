@@ -85,9 +85,9 @@ allocate, D falls back to direct for the remaining descriptors instead of
 aborting the transfer.
 
 `batch_transfer_sync_read` blocks the D thread, so D must send
-`PREPARE_READ` for window N+1 before entering the RDMA call for window N.
+`PREPARE_READ_BATCH` for window N+1 before entering the RDMA call for window N.
 P then gathers N+1 while that read runs. After the read completes, D sends
-`READ_ACK` for N, P releases lease N, and D scatters N locally. Scatter can
+`READ_ACK_BATCH` for N, P releases lease N, and D scatters N locally. Scatter can
 overlap the tail of gather N+1, but it does not overlap another RDMA on the
 same D thread.
 

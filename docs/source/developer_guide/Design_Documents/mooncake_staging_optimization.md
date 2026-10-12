@@ -1,14 +1,76 @@
 # Mooncake Staging Optimization Proposal
 
-This document records a design proposal for reducing control-plane round trips
-in the `MooncakeConnectorV1` staging path. It is based on the current P/D
-protocol and is intentionally written as a proposal; it does not imply that
-the protocol changes described here are already implemented.
+This document records both the staging changes that are already in the current
+checkout and the remaining proposals for reducing control-plane round trips.
+The landed changes are listed first. Later sections are remaining proposals,
+except where a section says the behavior is already implemented.
 
 The proposal keeps worker-level metadata separate from request-level transfer
 state. This distinction is important because `GET_META_MSG` is cacheable,
 while staging slots and packed ranges are allocated for one request and must be
 released after that request completes.
+
+
+## Landed Changes
+
+### Single-chunk execute path removed
+
+`DecodeStagingCoordinator` no longer has `_execute_chunk`. Every packed window,
+including a window of one chunk, uses `_execute_batch`. D sends
+`PREPARE_READ_BATCH` and `READ_ACK_BATCH` even when the window contains a
+single chunk.
+
+The single-chunk wire messages are removed. Their type numbers are retired and
+must not be reused:
+
+```text
+PREPARE_READ = 1
+PACK_READY   = 2
+READ_ACK     = 3
+```
+
+The READ path now uses only:
+
+```text
+PREPARE_READ_BATCH = 9
+PACK_READY_BATCH   = 10
+READ_ACK_BATCH     = 11
+```
+
+An old peer that still sends type 1 or 3 receives `ERR_UNKNOWN_TYPE`.
+`PrepareReadMsg` remains an internal per-chunk structure used to validate and
+gather one item inside a batch. `ReadAckMsg` and `handle_read_ack` remain
+because `READ_ACK_BATCH` releases each lease through them. The Layerwise WRITE
+messages are unchanged.
+
+### P gathers one batch and does not mix a window
+
+The P listener submits one future for each `PREPARE_READ_BATCH`. It does not
+split the batch into per-chunk gather tasks.
+
+Before gather, `StagingAllocator.try_allocate_all` reserves every chunk in the
+window under one lock. If any chunk has no contiguous extent, every lease taken
+by that attempt is released and P returns `STAGING_ERR_ARENA_EXHAUSTED` for
+every item. No gather starts, and no lease remains. A gather failure after a
+successful reservation also releases the whole batch. P does not return a mix
+of ready chunks and exhausted chunks.
+
+D already applies the same rule locally. If it cannot reserve every chunk in
+the window, it does not send `PREPARE_READ_BATCH` and transfers that window
+with direct RDMA. `min_direct_size` still classifies large entries as Direct
+before the window is formed. That split is not the mixed-window path.
+
+### One gather thread per rank
+
+The P gather pool has `max_workers=1`. One batch occupies that thread and
+gathers its chunks serially. The pool overlaps different requests only when a
+later batch is queued behind the running one; it does not overlap chunks inside
+one window.
+
+`VLLM_ASCEND_STAGING_MAX_CONCURRENT_CHUNKS` is the maximum number of chunks in
+one window. It is not the gather thread count. Gather stays off the ROUTER
+thread so `READ_ACK_BATCH` and other control messages are not blocked by the
+copy.
 
 ## Current Protocol
 
@@ -331,8 +393,10 @@ measured independently.
 
 ## All-or-Nothing Staging Window
 
-This proposal changes how a staging window reacts when the arena cannot hold
-every chunk. It is not implemented. It is separate from the prepared-manifest
+The P-side reservation and single-thread gather described here are implemented. See Landed Changes. The remaining note in this section is D's `fallback_rest` behavior.
+
+P now reserves a batch atomically and gathers it on one thread. D still
+falls back per rejected item if a mixed response arrives. It is separate from the prepared-manifest
 proposal above: that proposal removes a prepare round trip when P can pack
 ahead of time; this one removes a wasted acknowledgement round trip when the
 window cannot be packed at all.
@@ -342,31 +406,15 @@ chunk whose `payload_bytes` is 16 MiB. `StagingAllocator.allocate` rounds that
 payload up to the page size and either returns a lease for the whole payload or
 returns nothing. It does not shrink a 64 MiB chunk into the leftover 15 MiB.
 
-The mixed path is in the batch window, not in the allocator. D sends every
-chunk in the window in one `PREPARE_READ_BATCH`. P gathers the chunks that fit
-and returns `STAGING_ERR_ARENA_EXHAUSTED` for the rest. D then RDMA-reads the
-successful leases and sends the failed chunks through Direct. A 7-chunk window
-that only fits the first chunk still uses both control round trips:
+P no longer mixes a batch. Before gather, it reserves every chunk in the
+window or reserves none. A short arena returns `STAGING_ERR_ARENA_EXHAUSTED`
+for every item and starts no gather. The historical C96 mix, where 25 of 27
+short-arena transfers staged 1 of 7 chunks, came from per-chunk admission.
 
-```text
-D -> P  PREPARE_READ_BATCH          all chunks in the window
-D <- P  PACK_READY_BATCH            some ready, some exhausted
-        RDMA read of the ready chunks, then scatter
-D -> P  READ_ACK_BATCH              release only the granted leases
-D <- P  ACK
-        Direct RDMA for the exhausted chunks
-```
-
-That mix keeps the small-descriptor Direct transfer and still pays for one
-gather plus `READ_ACK_BATCH`. On the 2026-10-09 C96 run, 25 of 27 short-arena
-transfers staged 1 of 7 chunks and sent the other 6 through Direct.
-
-The window should be all staging or all Direct. Before gather, P checks that
-every chunk in the batch has a contiguous extent of its actual size. If yes, P
-reserves all of them and gathers. If any chunk does not fit, P reserves none
-and returns one batch-exhausted response. D then sends the whole window through
-Direct. The next window is judged again after earlier leases are released; one
-short window does not forbid staging for the rest of the request.
+D still consumes a mixed response item by item if one arrives. Its own arena
+check before `PREPARE_READ_BATCH` is already all-or-nothing. A later window is
+still forced to Direct after `fallback_rest`; judging that window again is not
+part of this change.
 
 D applies the same rule to its own arena before sending `PREPARE_READ_BATCH`.
 If D cannot hold every chunk, it does not send the prepare message.

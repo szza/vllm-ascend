@@ -2,10 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 """Prefill-side staging service.
 
-Handles ``PREPARE_READ`` requests from the decode side: gathers
-fragmented KV cache blocks into a contiguous staging slot and returns
-the slot address via ``PACK_READY``.  On ``READ_ACK`` the slot is
-released for reuse.
+Handles batched READ prepare requests from the decode side: gathers
+one whole window into staging extents and returns ``PACK_READY_BATCH``.
+On ``READ_ACK_BATCH`` the extents are released for reuse.
 
 The service is transport-agnostic — callers invoke methods directly
 (in-process tests) or via ZMQ (connector integration in Batch 4e).
@@ -17,13 +16,13 @@ import threading
 import time
 from dataclasses import dataclass, field
 from collections.abc import Callable
+from typing import Any
 
 import torch
 from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.copy import (
-    pack_into_staging,
-    pack_into_staging_multi,
+    pack_into_staging_multi_batch,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
     GatherEntry,
@@ -31,12 +30,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator, StagingLease
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
     STAGING_ERR_ARENA_EXHAUSTED,
-    PackReadyMsg,
     PackReadyBatchItem,
     PackReadyBatchMsg,
     PrepareReadBatchMsg,
     PrepareReadMsg,
-    StagingErrorMsg,
     ReadAckMsg,
 )
 
@@ -76,6 +73,11 @@ class PrefillStagingService:
     _staged_chunks: dict[str, set[int]] = field(default_factory=dict, init=False, repr=False)
     _staged_expected: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _staged_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _kv_ready_event: Any = field(default=None, init=False, repr=False)
+
+    def record_kv_ready(self, event: Any) -> None:
+        """Publish the event recorded when the producing forward completed."""
+        self._kv_ready_event = event
 
     def _record_staged_chunk(self, msg: PrepareReadMsg) -> None:
         """Notify the scheduler path when an all-staging request is gathered."""
@@ -145,195 +147,6 @@ class PrefillStagingService:
             return f"payload does not match gather ranges: max_end={max_end}, payload={msg.total_bytes}"
         return None
 
-    def handle_prepare_read(self, msg: PrepareReadMsg) -> PackReadyMsg | StagingErrorMsg:
-        """Gather KV data into a staging slot and return its address.
-
-        Returns ``PackReadyMsg`` on success, ``StagingErrorMsg`` if no
-        slot is available.
-        """
-        handler_started_at = time.perf_counter()
-        key = (msg.transfer_id, msg.chunk_id)
-
-        validation_started_at = time.perf_counter()
-        error = self._validate_prepare_read(msg)
-        validation_finished_at = time.perf_counter()
-        if error is not None:
-            return StagingErrorMsg(
-                transfer_id=msg.transfer_id,
-                chunk_id=msg.chunk_id,
-                code=3,
-                reason=error,
-            )
-
-        allocation_started_at = time.perf_counter()
-        is_owner = False
-        with self._active_leases_lock:
-            existing = self._active_leases.get(key)
-            if existing is None:
-                lease = self.allocator.allocate(msg.total_bytes)
-                if lease is None:
-                    logger.info(
-                        "P staging arena has no contiguous extent: transfer=%s chunk=%d "
-                        "bytes=%d free_bytes=%d capacity_bytes=%d",
-                        msg.transfer_id,
-                        msg.chunk_id,
-                        msg.total_bytes,
-                        self.allocator.free_bytes,
-                        self.allocator.capacity_bytes,
-                    )
-                    return StagingErrorMsg(
-                        transfer_id=msg.transfer_id,
-                        chunk_id=msg.chunk_id,
-                        code=STAGING_ERR_ARENA_EXHAUSTED,
-                        reason="staging arena has no contiguous extent available",
-                    )
-                existing = _ActiveLease(
-                    lease=lease,
-                    transfer_id=msg.transfer_id,
-                    chunk_id=msg.chunk_id,
-                )
-                self._active_leases[key] = existing
-                is_owner = True
-            elif existing.lease.payload_bytes != msg.total_bytes:
-                return StagingErrorMsg(
-                    transfer_id=msg.transfer_id,
-                    chunk_id=msg.chunk_id,
-                    code=3,
-                    reason="duplicate prepare changed payload size",
-                )
-        allocation_finished_at = time.perf_counter()
-
-        if not is_owner:
-            wait_started_at = time.perf_counter()
-            existing.ready.wait()
-            wait_finished_at = time.perf_counter()
-            if existing.error is not None:
-                return StagingErrorMsg(
-                    transfer_id=msg.transfer_id,
-                    chunk_id=msg.chunk_id,
-                    code=4,
-                    reason=existing.error,
-                )
-            logger.info(
-                "P handle_prepare timing: transfer=%s chunk=%d outcome=duplicate "
-                "validate_ms=%.2f slot_ms=%.2f duplicate_wait_ms=%.2f "
-                "handler_total_ms=%.2f",
-                msg.transfer_id,
-                msg.chunk_id,
-                (validation_finished_at - validation_started_at) * 1000,
-                (allocation_finished_at - allocation_started_at) * 1000,
-                (wait_finished_at - wait_started_at) * 1000,
-                (time.perf_counter() - handler_started_at) * 1000,
-            )
-            return PackReadyMsg(
-                transfer_id=msg.transfer_id,
-                chunk_id=msg.chunk_id,
-                lease_id=existing.lease.lease_id,
-                staging_addr=self.allocator.address(existing.lease),
-                payload_bytes=msg.total_bytes,
-            )
-
-        lease = existing.lease
-
-        entry_started_at = time.perf_counter()
-        gather_entries = [
-            GatherEntry(src_offset=src, packed_offset=off, nbytes=n) for src, off, n in msg.gather_entries
-        ]
-        entry_finished_at = time.perf_counter()
-
-        slot_view_started_at = time.perf_counter()
-        staging_view = self.allocator.view(lease)
-        slot_view_finished_at = time.perf_counter()
-        t_gather = time.perf_counter()
-        gather_timing: dict[str, float] = {}
-        try:
-            if self.kv_regions:
-                pack_into_staging_multi(self.kv_regions, staging_view, gather_entries, timing=gather_timing)
-            else:
-                pack_into_staging(
-                    self.kv_tensor,
-                    self.kv_base_addr,
-                    staging_view,
-                    gather_entries,
-                    timing=gather_timing,
-                )
-        except Exception:
-            with self._active_leases_lock:
-                active = self._active_leases.pop(key, None)
-            if active is not None:
-                active.error = "gather failed"
-                active.ready.set()
-                self.allocator.release(active.lease)
-            raise
-
-        gather_ms = (time.perf_counter() - t_gather) * 1000
-        pack_finished_at = time.perf_counter()
-
-        logger.info(
-            "P gather breakdown: transfer=%s chunk=%d entries=%d bytes=%d total_ms=%.2f "
-            "descriptor_ms=%.2f descriptor_list_ms=%.2f descriptor_tensor_ms=%.2f "
-            "descriptor_prepare_ms=%.2f descriptor_alloc_ms=%.2f "
-            "descriptor_fill_ms=%.2f "
-            "swap_blocks_batch_ms=%.2f synchronize_ms=%.2f copy_stream_wait_ms=%.2f "
-            "slice_gather_ms=%.2f pack_total_ms=%.2f",
-            msg.transfer_id,
-            msg.chunk_id,
-            len(gather_entries),
-            msg.total_bytes,
-            gather_ms,
-            gather_timing.get("descriptor_ms", 0.0),
-            gather_timing.get("descriptor_list_ms", 0.0),
-            gather_timing.get("descriptor_tensor_ms", 0.0),
-            gather_timing.get("descriptor_prepare_ms", 0.0),
-            gather_timing.get("descriptor_alloc_ms", 0.0),
-            gather_timing.get("descriptor_fill_ms", 0.0),
-            gather_timing.get("swap_blocks_batch_ms", 0.0),
-            gather_timing.get("synchronize_ms", 0.0),
-            gather_timing.get("copy_stream_wait_ms", 0.0),
-            gather_timing.get("slice_gather_ms", 0.0),
-            gather_timing.get(
-                "pack_into_staging_multi_ms",
-                gather_timing.get("pack_into_staging_ms", 0.0),
-            ),
-        )
-
-        existing.ready.set()
-        self._record_staged_chunk(msg)
-
-        staging_addr = self.allocator.address(lease)
-        response_preparation_finished_at = time.perf_counter()
-        logger.info(
-            "P handle_prepare timing: transfer=%s chunk=%d outcome=ready "
-            "validate_ms=%.2f slot_ms=%.2f entry_build_ms=%.2f slot_view_ms=%.2f "
-            "pack_ms=%.2f post_pack_ms=%.2f handler_total_ms=%.2f",
-            msg.transfer_id,
-            msg.chunk_id,
-            (validation_finished_at - validation_started_at) * 1000,
-            (allocation_finished_at - allocation_started_at) * 1000,
-            (entry_finished_at - entry_started_at) * 1000,
-            (slot_view_finished_at - slot_view_started_at) * 1000,
-            (pack_finished_at - t_gather) * 1000,
-            (response_preparation_finished_at - pack_finished_at) * 1000,
-            (response_preparation_finished_at - handler_started_at) * 1000,
-        )
-        logger.debug(
-            "P gather done: transfer=%s chunk=%d lease=%d addr=0x%x bytes=%d gather_ms=%.2f",
-            msg.transfer_id,
-            msg.chunk_id,
-            lease.lease_id,
-            staging_addr,
-            msg.total_bytes,
-            gather_ms,
-        )
-        return PackReadyMsg(
-            transfer_id=msg.transfer_id,
-            chunk_id=msg.chunk_id,
-            lease_id=lease.lease_id,
-            staging_addr=staging_addr,
-            payload_bytes=msg.total_bytes,
-            gather_ms=gather_ms,
-        )
-
     def handle_read_ack(self, msg: ReadAckMsg) -> bool:
         """Release the staging slot after D confirms the RDMA read is done.
 
@@ -365,45 +178,216 @@ class PrefillStagingService:
         return True
 
     def handle_prepare_read_batch(self, msg: PrepareReadBatchMsg) -> PackReadyBatchMsg:
-        """Gather a batch synchronously for direct callers and fallbacks.
+        """Reserve and gather one batch, or reserve nothing.
 
-        The ZMQ listener fans batch items out to its gather executor.  This
-        method remains the transport-independent implementation used by local
-        callers and tests.
+        A batch is one staging window. Partial allocation is not exposed to
+        the caller: either every chunk gets a lease and is gathered, or no
+        lease from this attempt remains active.
         """
-        results: list[PackReadyBatchItem] = []
-        for item in msg.chunks:
-            response = self.handle_prepare_read(
-                PrepareReadMsg(
-                    transfer_id=msg.transfer_id,
+        if not msg.chunks:
+            return PackReadyBatchMsg(transfer_id=msg.transfer_id, results=[])
+
+        prepares = [self._prepare_from_batch_item(msg, item) for item in msg.chunks]
+        validation_errors = [self._validate_prepare_read(prepare) for prepare in prepares]
+        if any(error is not None for error in validation_errors):
+            return self._failed_batch(
+                msg,
+                code=3,
+                errors=validation_errors,
+                default_error="batch rejected before allocation",
+            )
+
+        with self._active_leases_lock:
+            keys = [(msg.transfer_id, item.chunk_id) for item in msg.chunks]
+            existing = [self._active_leases.get(key) for key in keys]
+            if any(active is not None for active in existing) and not all(active is not None for active in existing):
+                return self._failed_batch(msg, code=3, default_error="partial duplicate prepare")
+            if all(active is not None for active in existing):
+                mismatched = [
+                    active is not None and active.lease.payload_bytes != item.total_bytes
+                    for active, item in zip(existing, msg.chunks)
+                ]
+                if any(mismatched):
+                    return self._failed_batch(msg, code=3, default_error="duplicate prepare changed payload size")
+                reused = existing
+                owned: list[_ActiveLease] = []
+            else:
+                leases = self.allocator.try_allocate_all([item.total_bytes for item in msg.chunks])
+                if leases is None:
+                    logger.info(
+                        "P staging batch arena exhausted: transfer=%s chunks=%d bytes=%d "
+                        "free_bytes=%d capacity_bytes=%d",
+                        msg.transfer_id,
+                        len(msg.chunks),
+                        sum(item.total_bytes for item in msg.chunks),
+                        self.allocator.free_bytes,
+                        self.allocator.capacity_bytes,
+                    )
+                    return self._failed_batch(
+                        msg,
+                        code=STAGING_ERR_ARENA_EXHAUSTED,
+                        default_error="staging arena has no contiguous extent for batch window",
+                    )
+                owned = []
+                for key, item, lease in zip(keys, msg.chunks, leases):
+                    active = _ActiveLease(lease=lease, transfer_id=msg.transfer_id, chunk_id=item.chunk_id)
+                    self._active_leases[key] = active
+                    owned.append(active)
+                reused = []
+
+        if reused:
+            results: list[PackReadyBatchItem] = []
+            for prepare, active in zip(prepares, reused):
+                assert active is not None
+                active.ready.wait()
+                if active.error is not None:
+                    results.append(
+                        PackReadyBatchItem(
+                            chunk_id=prepare.chunk_id,
+                            success=False,
+                            error_code=4,
+                            error=active.error,
+                        )
+                    )
+                    continue
+                results.append(
+                    PackReadyBatchItem(
+                        chunk_id=prepare.chunk_id,
+                        success=True,
+                        lease_id=active.lease.lease_id,
+                        staging_addr=self.allocator.address(active.lease),
+                        payload_bytes=prepare.total_bytes,
+                    )
+                )
+            return PackReadyBatchMsg(transfer_id=msg.transfer_id, results=results)
+
+        results = []
+        try:
+            window_gather_ms, gather_timing = self._gather_window(prepares, owned)
+            for index, (prepare, active) in enumerate(zip(prepares, owned)):
+                results.append(
+                    PackReadyBatchItem(
+                        chunk_id=prepare.chunk_id,
+                        success=True,
+                        lease_id=active.lease.lease_id,
+                        staging_addr=self.allocator.address(active.lease),
+                        payload_bytes=prepare.total_bytes,
+                        # Window time lives on the first chunk so callers that
+                        # sum per-chunk gather_ms do not multiply it.
+                        gather_ms=window_gather_ms if index == 0 else 0.0,
+                    )
+                )
+            self._log_window_gather(prepares[0].transfer_id, prepares, window_gather_ms, gather_timing)
+            for prepare in prepares:
+                self._record_staged_chunk(prepare)
+        except Exception as exc:
+            logger.exception("P staging batch gather failed: transfer=%s", msg.transfer_id)
+            self._release_owned_batch(msg.transfer_id, owned, error=f"gather failed: {exc}")
+            return self._failed_batch(msg, code=4, default_error=f"gather failed: {exc}")
+        finally:
+            for active in owned:
+                active.ready.set()
+        return PackReadyBatchMsg(transfer_id=msg.transfer_id, results=results)
+
+    def _prepare_from_batch_item(self, msg: PrepareReadBatchMsg, item: Any) -> PrepareReadMsg:
+        return PrepareReadMsg(
+            transfer_id=msg.transfer_id,
+            chunk_id=item.chunk_id,
+            gather_entries=item.gather_entries,
+            total_bytes=item.total_bytes,
+            release_source_when_ready=msg.release_source_when_ready,
+            expected_chunks=msg.expected_chunks,
+        )
+
+    def _gather_window(
+        self,
+        prepares: list[PrepareReadMsg],
+        owned: list[_ActiveLease],
+    ) -> tuple[float, dict[str, float]]:
+        regions = self.kv_regions
+        if not regions:
+            regions = [(self.kv_base_addr, self.kv_tensor)]
+        staging_views = []
+        gather_batches = []
+        for prepare, active in zip(prepares, owned):
+            staging_views.append(self.allocator.view(active.lease))
+            gather_batches.append(
+                [GatherEntry(src_offset=src, packed_offset=off, nbytes=n) for src, off, n in prepare.gather_entries]
+            )
+        gather_timing: dict[str, float] = {}
+        started_at = time.perf_counter()
+        pack_into_staging_multi_batch(
+            regions,
+            staging_views,
+            gather_batches,
+            timing=gather_timing,
+            ready_event=self._kv_ready_event,
+        )
+        return (time.perf_counter() - started_at) * 1000, gather_timing
+
+    def _log_window_gather(
+        self,
+        transfer_id: str,
+        prepares: list[PrepareReadMsg],
+        gather_ms: float,
+        gather_timing: dict[str, float],
+    ) -> None:
+        logger.info(
+            "P gather batch breakdown: transfer=%s chunks=%d entries=%d bytes=%d total_ms=%.2f "
+            "descriptor_ms=%.2f descriptor_list_ms=%.2f descriptor_tensor_ms=%.2f "
+            "descriptor_prepare_ms=%.2f descriptor_alloc_ms=%.2f "
+            "descriptor_fill_ms=%.2f "
+            "swap_blocks_batch_ms=%.2f synchronize_ms=%.2f copy_stream_wait_ms=%.2f "
+            "slice_gather_ms=%.2f pack_total_ms=%.2f kv_ready=%s",
+            transfer_id,
+            len(prepares),
+            sum(len(prepare.gather_entries) for prepare in prepares),
+            sum(prepare.total_bytes for prepare in prepares),
+            gather_ms,
+            gather_timing.get("descriptor_ms", 0.0),
+            gather_timing.get("descriptor_list_ms", 0.0),
+            gather_timing.get("descriptor_tensor_ms", 0.0),
+            gather_timing.get("descriptor_prepare_ms", 0.0),
+            gather_timing.get("descriptor_alloc_ms", 0.0),
+            gather_timing.get("descriptor_fill_ms", 0.0),
+            gather_timing.get("swap_blocks_batch_ms", 0.0),
+            gather_timing.get("synchronize_ms", 0.0),
+            gather_timing.get("copy_stream_wait_ms", 0.0),
+            gather_timing.get("slice_gather_ms", 0.0),
+            gather_timing.get("pack_into_staging_multi_batch_ms", 0.0),
+            "event" if self._kv_ready_event is not None else "none",
+        )
+
+    def _failed_batch(
+        self,
+        msg: PrepareReadBatchMsg,
+        *,
+        code: int,
+        default_error: str,
+        errors: list[str | None] | None = None,
+    ) -> PackReadyBatchMsg:
+        results = []
+        for index, item in enumerate(msg.chunks):
+            error = errors[index] if errors is not None and errors[index] is not None else default_error
+            results.append(
+                PackReadyBatchItem(
                     chunk_id=item.chunk_id,
-                    gather_entries=item.gather_entries,
-                    total_bytes=item.total_bytes,
-                    release_source_when_ready=msg.release_source_when_ready,
-                    expected_chunks=msg.expected_chunks,
+                    success=False,
+                    error_code=code,
+                    error=error,
                 )
             )
-            if isinstance(response, StagingErrorMsg):
-                results.append(
-                    PackReadyBatchItem(
-                        chunk_id=item.chunk_id,
-                        success=False,
-                        error_code=response.code,
-                        error=response.reason,
-                    )
-                )
-            else:
-                results.append(
-                    PackReadyBatchItem(
-                        chunk_id=item.chunk_id,
-                        success=True,
-                        lease_id=response.lease_id,
-                        staging_addr=response.staging_addr,
-                        payload_bytes=response.payload_bytes,
-                        gather_ms=response.gather_ms,
-                    )
-                )
         return PackReadyBatchMsg(transfer_id=msg.transfer_id, results=results)
+
+    def _release_owned_batch(self, transfer_id: str, owned: list[_ActiveLease], *, error: str) -> None:
+        with self._active_leases_lock:
+            for active in owned:
+                active.error = error
+                current = self._active_leases.get((transfer_id, active.chunk_id))
+                if current is active:
+                    self._active_leases.pop((transfer_id, active.chunk_id), None)
+        for active in owned:
+            self.allocator.release(active.lease)
 
     @property
     def active_lease_count(self) -> int:

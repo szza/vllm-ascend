@@ -16,6 +16,7 @@ from __future__ import annotations
 import bisect
 import time
 from collections.abc import Sequence
+from typing import Any
 
 import torch
 
@@ -53,6 +54,7 @@ def _run_batch_copy(
     timing: dict[str, float] | None = None,
     *,
     wait_current_stream: bool = False,
+    ready_event: Any | None = None,
 ) -> None:
     """Submit and wait for one batch copy without synchronizing the default stream.
 
@@ -61,6 +63,11 @@ def _run_batch_copy(
     the peer, so wait for a completion event before returning from a batch
     gather or scatter.  The event is recorded on a dedicated stream, which
     avoids waiting for unrelated work queued on the current/default stream.
+
+    ``ready_event`` is the preferred gather dependency: an event recorded on
+    the model stream when the producing forward completed.  Waiting on
+    ``current_stream`` at gather time also waits for later requests queued
+    on that stream, so the batch gather path must not use it.
     """
     npu = getattr(torch, "npu", None)
     if npu is None:
@@ -73,11 +80,16 @@ def _run_batch_copy(
         return
 
     t_swap = time.perf_counter()
-    current_stream = npu.current_stream() if wait_current_stream else None
+    current_stream = npu.current_stream() if wait_current_stream and ready_event is None else None
     with torch.npu.stream(copy_stream):
-        if current_stream is not None:
-            # Gather reads KV data produced by the model stream.  Preserve
-            # that dependency without synchronizing the host on the stream.
+        if ready_event is not None:
+            wait_event = getattr(copy_stream, "wait_event", None)
+            if wait_event is None:
+                raise RuntimeError("NPU copy stream cannot wait on the KV-ready event")
+            wait_event(ready_event)
+        elif current_stream is not None:
+            # Single-chunk callers still order the copy after the caller
+            # stream.  The windowed gather path passes ready_event instead.
             copy_stream.wait_stream(current_stream)
         torch.ops._C_ascend.swap_blocks_batch(src_ptrs, dst_ptrs, sizes, DIRECTION_D2D)
         copy_done = torch.npu.Event()
@@ -147,6 +159,38 @@ def _batch_gather(
         timing["descriptor_ms"] = (time.perf_counter() - t_descriptor) * 1000
 
     _run_batch_copy(src_ptrs, dst_ptrs, sizes, timing, wait_current_stream=True)
+
+
+def _batch_gather_multi(
+    gather_batches: Sequence[tuple[int, Sequence[GatherEntry]]],
+    timing: dict[str, float] | None = None,
+    ready_event: Any | None = None,
+) -> None:
+    """Submit gather entries for multiple staging slots in one DMA batch."""
+    t_descriptor = time.perf_counter()
+    src_addrs: list[int] = []
+    dst_addrs: list[int] = []
+    size_values: list[int] = []
+    for staging_base_addr, gather_entries in gather_batches:
+        for entry in gather_entries:
+            src_addrs.append(entry.src_offset)
+            dst_addrs.append(staging_base_addr + entry.packed_offset)
+            size_values.append(entry.nbytes)
+    t_descriptor_prepare = time.perf_counter()
+    src_ptrs, dst_ptrs, sizes = _build_cpu_descriptor_tensors(src_addrs, dst_addrs, size_values)
+    t_descriptor_alloc = time.perf_counter()
+
+    if timing is not None:
+        timing["descriptor_list_ms"] = (t_descriptor_prepare - t_descriptor) * 1000
+        timing["descriptor_tensor_ms"] = (t_descriptor_alloc - t_descriptor_prepare) * 1000
+        timing["descriptor_prepare_ms"] = (t_descriptor_prepare - t_descriptor) * 1000
+        timing["descriptor_alloc_ms"] = (t_descriptor_alloc - t_descriptor_prepare) * 1000
+        timing["descriptor_fill_ms"] = (t_descriptor_alloc - t_descriptor_prepare) * 1000
+        timing["descriptor_ms"] = (time.perf_counter() - t_descriptor) * 1000
+
+    # Do not wait on the caller's current stream.  That stream includes later
+    # prefill work and is what turned a 64 MiB gather into a 1s synchronize.
+    _run_batch_copy(src_ptrs, dst_ptrs, sizes, timing, ready_event=ready_event)
 
 
 def _batch_scatter(
@@ -378,6 +422,49 @@ def unpack_from_staging_multi(
         timing["unpack_from_staging_multi_ms"] = (time.perf_counter() - t_total) * 1000
 
 
+def pack_into_staging_multi_batch(
+    regions: Sequence[tuple[int, torch.Tensor]],
+    staging_views: Sequence[torch.Tensor],
+    gather_entry_batches: Sequence[Sequence[GatherEntry]],
+    timing: dict[str, float] | None = None,
+    ready_event: Any | None = None,
+) -> None:
+    """Gather multiple staging slots from KV regions with one DMA batch.
+
+    The device dependency is ``ready_event``, recorded when the producing
+    forward completed.  This function does not wait on the current stream.
+    """
+    if len(staging_views) != len(gather_entry_batches):
+        raise ValueError(
+            "staging_views and gather_entry_batches must have the same length: "
+            f"views={len(staging_views)}, batches={len(gather_entry_batches)}"
+        )
+    if not staging_views or not any(gather_entry_batches):
+        return
+
+    t_total = time.perf_counter()
+    use_dma = _check_batch_dma() and all(getattr(view, "is_npu", False) for view in staging_views)
+    if use_dma:
+        _batch_gather_multi(
+            tuple(
+                (staging.data_ptr(), gather_entries)
+                for staging, gather_entries in zip(staging_views, gather_entry_batches)
+                if gather_entries
+            ),
+            timing,
+            ready_event=ready_event,
+        )
+    else:
+        t_slice = time.perf_counter()
+        for staging, gather_entries in zip(staging_views, gather_entry_batches):
+            if gather_entries:
+                _slice_gather_multi(regions, staging, gather_entries)
+        if timing is not None:
+            timing["slice_gather_ms"] = (time.perf_counter() - t_slice) * 1000
+    if timing is not None:
+        timing["pack_into_staging_multi_batch_ms"] = (time.perf_counter() - t_total) * 1000
+
+
 def unpack_from_staging_multi_batch(
     staging_views: Sequence[torch.Tensor],
     regions: Sequence[tuple[int, torch.Tensor]],
@@ -514,5 +601,6 @@ __all__ = [
     "pack_into_staging_multi",
     "unpack_from_staging",
     "unpack_from_staging_multi",
+    "pack_into_staging_multi_batch",
     "unpack_from_staging_multi_batch",
 ]

@@ -32,14 +32,13 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.planner import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.allocator import StagingAllocator
 from vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.protocol import (
+    PackReadyBatchItem,
     PackReadyBatchMsg,
-    PackReadyMsg,
     PrepareReadBatchItem,
     PrepareReadBatchMsg,
-    PrepareReadMsg,
     ReadAckBatchMsg,
     ReadAckMsg,
-    StagingErrorMsg,
+    STAGING_ERR_ARENA_EXHAUSTED,
 )
 
 
@@ -127,12 +126,23 @@ class _Fixture:
 
         self.ack_log: list[ReadAckMsg] = []
 
-    def prepare_read_fn(self, msg: PrepareReadMsg) -> PackReadyMsg | StagingErrorMsg:
-        return self.p_service.handle_prepare_read(msg)
-
     def send_ack_fn(self, msg: ReadAckMsg) -> None:
         self.p_service.handle_read_ack(msg)
         self.ack_log.append(msg)
+
+    def prepare_read_batch_fn(self, msg: PrepareReadBatchMsg) -> PackReadyBatchMsg:
+        return self.p_service.handle_prepare_read_batch(msg)
+
+    def send_ack_batch_fn(self, msg: ReadAckBatchMsg) -> None:
+        for item in msg.results:
+            self.send_ack_fn(
+                ReadAckMsg(
+                    transfer_id=msg.transfer_id,
+                    chunk_id=item.chunk_id,
+                    lease_id=item.lease_id,
+                    success=item.success,
+                )
+            )
 
 
 # =====================================================================
@@ -161,9 +171,9 @@ class TestStagedTransfer:
             plan,
             transfer_id="tx-001",
             direct_transfer=f.direct_transfer,
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.prepare_read_batch_fn,
+            send_ack_batch=f.send_ack_batch_fn,
         )
 
         assert result.success
@@ -196,9 +206,9 @@ class TestStagedTransfer:
             plan,
             transfer_id="tx-002",
             direct_transfer=f.direct_transfer,
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.prepare_read_batch_fn,
+            send_ack_batch=f.send_ack_batch_fn,
         )
 
         assert result.success
@@ -243,9 +253,7 @@ class TestStagedTransfer:
             plan,
             transfer_id="tx-batch",
             direct_transfer=f.direct_transfer,
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
             prepare_read_batch=f.p_service.handle_prepare_read_batch,
             send_ack_batch=send_ack_batch,
             rdma_read_batch=rdma_read_batch,
@@ -276,9 +284,9 @@ class TestStagedTransfer:
             plan,
             transfer_id="tx-003",
             direct_transfer=f.direct_transfer,
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.prepare_read_batch_fn,
+            send_ack_batch=f.send_ack_batch_fn,
         )
 
         assert result.success
@@ -327,9 +335,9 @@ class TestStagedTransfer:
             plan,
             transfer_id="tx-004",
             direct_transfer=f.direct_transfer,
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.prepare_read_batch_fn,
+            send_ack_batch=f.send_ack_batch_fn,
         )
 
         assert result.success
@@ -391,9 +399,7 @@ class TestStagedTransfer:
             plan,
             transfer_id="tx-merged",
             direct_transfer=f.direct_transfer,
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
             prepare_read_batch=f.p_service.handle_prepare_read_batch,
             send_ack_batch=send_ack_batch,
             rdma_read_batch=merged_rdma_read,
@@ -425,9 +431,9 @@ class TestStagedTransfer:
             plan,
             transfer_id="tx-005",
             direct_transfer=f.direct_transfer,
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.prepare_read_batch_fn,
+            send_ack_batch=f.send_ack_batch_fn,
         )
 
         assert result.success
@@ -484,13 +490,24 @@ class TestStagedEquivalence:
         rdma_fn = _make_rdma_read_fn(p_pool, d_pool)
         direct_fn = _make_direct_transfer_fn(p_kv, p_kv.data_ptr(), stg_dst, stg_base)
 
+        def send_ack_batch(msg: ReadAckBatchMsg) -> None:
+            for item in msg.results:
+                p_svc.handle_read_ack(
+                    ReadAckMsg(
+                        transfer_id=msg.transfer_id,
+                        chunk_id=item.chunk_id,
+                        lease_id=item.lease_id,
+                        success=item.success,
+                    )
+                )
+
         result = d_coord.execute(
             plan_stg,
             transfer_id="eq-test",
             direct_transfer=direct_fn,
-            prepare_read=p_svc.handle_prepare_read,
             rdma_read=rdma_fn,
-            send_ack=lambda msg: p_svc.handle_read_ack(msg),
+            prepare_read_batch=p_svc.handle_prepare_read_batch,
+            send_ack_batch=send_ack_batch,
         )
 
         assert result.success
@@ -520,9 +537,9 @@ class TestFailureHandling:
             plan,
             transfer_id="tx-fail-p",
             direct_transfer=f.direct_transfer,
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.prepare_read_batch_fn,
+            send_ack_batch=f.send_ack_batch_fn,
         )
 
         assert result.success
@@ -535,9 +552,9 @@ class TestFailureHandling:
         f.d_pool.allocate(8192)
         prepares = {"n": 0}
 
-        def prepare(msg: PrepareReadMsg):
+        def prepare_batch(msg: PrepareReadBatchMsg) -> PackReadyBatchMsg:
             prepares["n"] += 1
-            return f.prepare_read_fn(msg)
+            return f.prepare_read_batch_fn(msg)
 
         src_list = [f.p_base]
         dst_list = [f.d_base]
@@ -551,9 +568,9 @@ class TestFailureHandling:
             plan,
             transfer_id="tx-fail-d",
             direct_transfer=f.direct_transfer,
-            prepare_read=prepare,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=prepare_batch,
+            send_ack_batch=f.send_ack_batch_fn,
         )
 
         assert result.success
@@ -564,8 +581,19 @@ class TestFailureHandling:
         """A prepare error other than arena exhaustion still fails the transfer."""
         f = _Fixture()
 
-        def prepare(msg: PrepareReadMsg) -> StagingErrorMsg:
-            return StagingErrorMsg(msg.transfer_id, msg.chunk_id, 3, "source range invalid")
+        def prepare_batch(msg: PrepareReadBatchMsg) -> PackReadyBatchMsg:
+            return PackReadyBatchMsg(
+                transfer_id=msg.transfer_id,
+                results=[
+                    PackReadyBatchItem(
+                        chunk_id=item.chunk_id,
+                        success=False,
+                        error_code=3,
+                        error="source range invalid",
+                    )
+                    for item in msg.chunks
+                ],
+            )
 
         src_list = [f.p_base]
         dst_list = [f.d_base]
@@ -578,9 +606,9 @@ class TestFailureHandling:
             plan,
             transfer_id="tx-bad-prepare",
             direct_transfer=f.direct_transfer,
-            prepare_read=prepare,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=prepare_batch,
+            send_ack_batch=f.send_ack_batch_fn,
         )
         assert not result.success
         assert "source range invalid" in result.error
@@ -604,9 +632,9 @@ class TestFailureHandling:
             plan,
             transfer_id="tx-fail-rdma",
             direct_transfer=f.direct_transfer,
-            prepare_read=f.prepare_read_fn,
             rdma_read=failing_rdma,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.prepare_read_batch_fn,
+            send_ack_batch=f.send_ack_batch_fn,
         )
 
         assert not result.success
@@ -622,21 +650,21 @@ class TestFailureHandling:
         plan = TransferPlanner(min_direct_size=f.min_direct_size, chunk_capacity=f.chunk_capacity).plan(
             spans, peer_session="p0"
         )
-        real_unpack = d_coordinator_mod.unpack_from_staging
+        real_unpack = d_coordinator_mod.unpack_from_staging_multi_batch
 
         def unpack_and_check(*args, **kwargs):
             assert f.p_service.active_lease_count == 0
             assert f.ack_log and f.ack_log[-1].success
             return real_unpack(*args, **kwargs)
 
-        monkeypatch.setattr(d_coordinator_mod, "unpack_from_staging", unpack_and_check)
+        monkeypatch.setattr(d_coordinator_mod, "unpack_from_staging_multi_batch", unpack_and_check)
         result = f.d_coordinator.execute(
             plan,
             transfer_id="tx-ack-before-scatter",
             direct_transfer=f.direct_transfer,
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.prepare_read_batch_fn,
+            send_ack_batch=f.send_ack_batch_fn,
         )
         assert result.success
         assert f.p_service.active_lease_count == 0
@@ -680,9 +708,7 @@ class TestFailureHandling:
             plan,
             transfer_id="tx-batch-ack-before-scatter",
             direct_transfer=f.direct_transfer,
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
             prepare_read_batch=f.p_service.handle_prepare_read_batch,
             send_ack_batch=send_ack_batch,
             rdma_read_batch=lambda d_addrs, p_addrs, lengths: (
@@ -695,9 +721,8 @@ class TestFailureHandling:
         assert result.success
         assert seen["calls"] >= 1
         assert f.p_service.active_lease_count == 0
-        assert len(f.ack_log) == 1
-        assert f.ack_log[0].success is False
-        assert f.p_service.active_lease_count == 0
+        assert len(f.ack_log) == len(plan.packed_chunks)
+        assert all(item.success for item in f.ack_log)
 
     def test_direct_transfer_failure(self) -> None:
         """Direct transfer returns non-zero → failure reported."""
@@ -724,9 +749,9 @@ class TestFailureHandling:
             plan,
             transfer_id="tx-fail-direct",
             direct_transfer=failing_direct,
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.prepare_read_batch_fn,
+            send_ack_batch=f.send_ack_batch_fn,
         )
 
         assert not result.success
@@ -744,33 +769,72 @@ class TestPrefillService:
         completed: list[str] = []
         f.p_service.on_transfer_staged = completed.append
         common = dict(
-            transfer_id="tx-early-release",
             gather_entries=[(f.p_base, 0, f.block_len)],
             total_bytes=f.block_len,
-            release_source_when_ready=True,
-            expected_chunks=2,
         )
 
-        first = f.p_service.handle_prepare_read(PrepareReadMsg(chunk_id=0, **common))
-        assert isinstance(first, PackReadyMsg)
-        assert completed == []
-        second = f.p_service.handle_prepare_read(PrepareReadMsg(chunk_id=1, **common))
-        assert isinstance(second, PackReadyMsg)
+        response = f.p_service.handle_prepare_read_batch(
+            PrepareReadBatchMsg(
+                transfer_id="tx-early-release",
+                release_source_when_ready=True,
+                expected_chunks=2,
+                chunks=[
+                    PrepareReadBatchItem(chunk_id=0, **common),
+                    PrepareReadBatchItem(chunk_id=1, **common),
+                ],
+            )
+        )
+        assert isinstance(response, PackReadyBatchMsg)
         assert completed == ["tx-early-release"]
 
-        # A duplicate prepare reuses the lease and must not fire the callback.
-        duplicate = f.p_service.handle_prepare_read(PrepareReadMsg(chunk_id=1, **common))
-        assert isinstance(duplicate, PackReadyMsg)
+        duplicate = f.p_service.handle_prepare_read_batch(
+            PrepareReadBatchMsg(
+                transfer_id="tx-early-release",
+                release_source_when_ready=True,
+                expected_chunks=2,
+                chunks=[PrepareReadBatchItem(chunk_id=1, **common)],
+            )
+        )
+        assert isinstance(duplicate, PackReadyBatchMsg)
+        assert duplicate.results[0].success
         assert completed == ["tx-early-release"]
 
-        for chunk_id, response in ((0, first), (1, second)):
+        for item in response.results:
             assert f.p_service.handle_read_ack(
                 ReadAckMsg(
                     transfer_id="tx-early-release",
-                    chunk_id=chunk_id,
-                    lease_id=response.lease_id,
+                    chunk_id=item.chunk_id,
+                    lease_id=item.lease_id,
                 )
             )
+
+    def test_prepare_read_batch_does_not_mix_when_arena_cannot_hold_every_chunk(self) -> None:
+        """A short arena rejects the whole batch and keeps no lease."""
+        f = _Fixture(num_slots=1, slot_capacity=512, chunk_capacity=512)
+        msg = PrepareReadBatchMsg(
+            transfer_id="tx-batch-nomix",
+            chunks=[
+                PrepareReadBatchItem(
+                    chunk_id=0,
+                    gather_entries=[(f.p_base, 0, f.block_len)],
+                    total_bytes=f.block_len,
+                ),
+                PrepareReadBatchItem(
+                    chunk_id=1,
+                    gather_entries=[(f.p_base + f.block_len, 0, f.block_len)],
+                    total_bytes=f.block_len,
+                ),
+            ],
+        )
+
+        response = f.p_service.handle_prepare_read_batch(msg)
+
+        assert isinstance(response, PackReadyBatchMsg)
+        assert [item.chunk_id for item in response.results] == [0, 1]
+        assert all(not item.success for item in response.results)
+        assert all(item.error_code == STAGING_ERR_ARENA_EXHAUSTED for item in response.results)
+        assert f.p_service.active_lease_count == 0
+        assert f.p_pool.free_bytes == f.p_pool.capacity_bytes
 
     def test_prepare_read_batch_returns_per_chunk_results(self) -> None:
         f = _Fixture(num_slots=2)
@@ -803,34 +867,42 @@ class TestPrefillService:
         assert f.p_service.active_lease_count == 0
 
     def test_idempotent_prepare_read(self) -> None:
-        """Duplicate PREPARE_READ returns same slot (no double alloc)."""
+        """Duplicate batch prepare returns the same lease."""
         f = _Fixture()
-        msg = PrepareReadMsg(
+        msg = PrepareReadBatchMsg(
             transfer_id="tx-idem",
-            chunk_id=0,
-            gather_entries=[(f.p_base, 0, f.block_len)],
-            total_bytes=f.block_len,
+            chunks=[
+                PrepareReadBatchItem(
+                    chunk_id=0,
+                    gather_entries=[(f.p_base, 0, f.block_len)],
+                    total_bytes=f.block_len,
+                )
+            ],
         )
 
-        r1 = f.p_service.handle_prepare_read(msg)
-        r2 = f.p_service.handle_prepare_read(msg)
+        r1 = f.p_service.handle_prepare_read_batch(msg)
+        r2 = f.p_service.handle_prepare_read_batch(msg)
 
-        assert isinstance(r1, PackReadyMsg)
-        assert isinstance(r2, PackReadyMsg)
-        assert r1.staging_addr == r2.staging_addr
+        assert r1.results[0].success and r2.results[0].success
+        assert r1.results[0].staging_addr == r2.results[0].staging_addr
         assert f.p_service.active_lease_count == 1
 
     def test_read_ack_idempotent(self) -> None:
         """Duplicate READ_ACK is a no-op (returns False)."""
         f = _Fixture()
-        msg = PrepareReadMsg(
-            transfer_id="tx-ack-idem",
-            chunk_id=0,
-            gather_entries=[(f.p_base, 0, f.block_len)],
-            total_bytes=f.block_len,
+        ready = f.p_service.handle_prepare_read_batch(
+            PrepareReadBatchMsg(
+                transfer_id="tx-ack-idem",
+                chunks=[
+                    PrepareReadBatchItem(
+                        chunk_id=0,
+                        gather_entries=[(f.p_base, 0, f.block_len)],
+                        total_bytes=f.block_len,
+                    )
+                ],
+            )
         )
-        ready = f.p_service.handle_prepare_read(msg)
-        ack = ReadAckMsg(transfer_id="tx-ack-idem", chunk_id=0, lease_id=ready.lease_id)
+        ack = ReadAckMsg(transfer_id="tx-ack-idem", chunk_id=0, lease_id=ready.results[0].lease_id)
         assert f.p_service.handle_read_ack(ack) is True
         assert f.p_service.handle_read_ack(ack) is False
 
@@ -842,17 +914,22 @@ class TestPrefillService:
 
     def test_prepare_rejects_out_of_range_source(self) -> None:
         f = _Fixture()
-        msg = PrepareReadMsg(
-            transfer_id="tx-invalid-src",
-            chunk_id=0,
-            gather_entries=[(f.p_base - 1, 0, f.block_len)],
-            total_bytes=f.block_len,
+        response = f.p_service.handle_prepare_read_batch(
+            PrepareReadBatchMsg(
+                transfer_id="tx-invalid-src",
+                chunks=[
+                    PrepareReadBatchItem(
+                        chunk_id=0,
+                        gather_entries=[(f.p_base - 1, 0, f.block_len)],
+                        total_bytes=f.block_len,
+                    )
+                ],
+            )
         )
 
-        response = f.p_service.handle_prepare_read(msg)
-
-        assert isinstance(response, StagingErrorMsg)
-        assert "outside" in response.reason
+        assert isinstance(response, PackReadyBatchMsg)
+        assert not response.results[0].success
+        assert "outside" in response.results[0].error
         assert f.p_service.active_lease_count == 0
         assert f.p_pool.allocate(8192) is not None
 
@@ -863,19 +940,24 @@ class TestPrefillService:
             raise RuntimeError("gather failed")
 
         monkeypatch.setattr(
-            "vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.p_service.pack_into_staging",
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.packed_kv.p_service.pack_into_staging_multi_batch",
             fail_gather,
         )
-        msg = PrepareReadMsg(
-            transfer_id="tx-gather-fail",
-            chunk_id=0,
-            gather_entries=[(f.p_base, 0, f.block_len)],
-            total_bytes=f.block_len,
+        response = f.p_service.handle_prepare_read_batch(
+            PrepareReadBatchMsg(
+                transfer_id="tx-gather-fail",
+                chunks=[
+                    PrepareReadBatchItem(
+                        chunk_id=0,
+                        gather_entries=[(f.p_base, 0, f.block_len)],
+                        total_bytes=f.block_len,
+                    )
+                ],
+            )
         )
 
-        with pytest.raises(RuntimeError, match="gather failed"):
-            f.p_service.handle_prepare_read(msg)
-
+        assert not response.results[0].success
+        assert "gather failed" in response.results[0].error
         assert f.p_service.active_lease_count == 0
         lease = f.p_pool.allocate(8192)
         assert lease is not None
@@ -883,18 +965,22 @@ class TestPrefillService:
 
     def test_concurrent_duplicate_prepare_reuses_one_slot(self) -> None:
         f = _Fixture(num_slots=2)
-        msg = PrepareReadMsg(
+        msg = PrepareReadBatchMsg(
             transfer_id="tx-concurrent",
-            chunk_id=0,
-            gather_entries=[(f.p_base, 0, f.block_len)],
-            total_bytes=f.block_len,
+            chunks=[
+                PrepareReadBatchItem(
+                    chunk_id=0,
+                    gather_entries=[(f.p_base, 0, f.block_len)],
+                    total_bytes=f.block_len,
+                )
+            ],
         )
 
         with ThreadPoolExecutor(max_workers=2) as executor:
-            responses = list(executor.map(lambda _: f.p_service.handle_prepare_read(msg), range(2)))
+            responses = list(executor.map(lambda _: f.p_service.handle_prepare_read_batch(msg), range(2)))
 
-        assert all(isinstance(response, PackReadyMsg) for response in responses)
-        assert responses[0].staging_addr == responses[1].staging_addr
+        assert all(response.results[0].success for response in responses)
+        assert responses[0].results[0].staging_addr == responses[1].results[0].staging_addr
         assert f.p_service.active_lease_count == 1
 
 
@@ -966,12 +1052,23 @@ class _MultiRegionFixture:
         self.rdma_read = _make_rdma_read_fn_multi(self.p_pool, self.d_pool)
         self.ack_log: list[ReadAckMsg] = []
 
-    def prepare_read_fn(self, msg: PrepareReadMsg) -> PackReadyMsg | StagingErrorMsg:
-        return self.p_service.handle_prepare_read(msg)
-
     def send_ack_fn(self, msg: ReadAckMsg) -> None:
         self.p_service.handle_read_ack(msg)
         self.ack_log.append(msg)
+
+    def prepare_read_batch_fn(self, msg: PrepareReadBatchMsg) -> PackReadyBatchMsg:
+        return self.p_service.handle_prepare_read_batch(msg)
+
+    def send_ack_batch_fn(self, msg: ReadAckBatchMsg) -> None:
+        for item in msg.results:
+            self.send_ack_fn(
+                ReadAckMsg(
+                    transfer_id=msg.transfer_id,
+                    chunk_id=item.chunk_id,
+                    lease_id=item.lease_id,
+                    success=item.success,
+                )
+            )
 
 
 class TestMultiRegionStagedTransfer:
@@ -995,9 +1092,9 @@ class TestMultiRegionStagedTransfer:
         result = f.d_coordinator.execute(
             plan,
             transfer_id="tx-multi-001",
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.prepare_read_batch_fn,
+            send_ack_batch=f.send_ack_batch_fn,
         )
 
         assert result.success
@@ -1027,9 +1124,9 @@ class TestMultiRegionStagedTransfer:
         result = f.d_coordinator.execute(
             plan,
             transfer_id="tx-multi-002",
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.prepare_read_batch_fn,
+            send_ack_batch=f.send_ack_batch_fn,
         )
 
         assert result.success
@@ -1061,9 +1158,9 @@ class TestMultiRegionStagedTransfer:
         result = f.d_coordinator.execute(
             plan,
             transfer_id="tx-multi-003",
-            prepare_read=f.prepare_read_fn,
             rdma_read=f.rdma_read,
-            send_ack=f.send_ack_fn,
+            prepare_read_batch=f.prepare_read_batch_fn,
+            send_ack_batch=f.send_ack_batch_fn,
         )
 
         assert result.success

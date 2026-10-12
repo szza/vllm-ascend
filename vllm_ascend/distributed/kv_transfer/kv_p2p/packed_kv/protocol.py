@@ -6,9 +6,9 @@ Defines the message types exchanged between coordinator and service
 for the packed KV transfer protocol.
 
 READ mode (v1 connector — D initiates):
-  D → P: ``PrepareReadMsg``  — request P to gather into a staging extent
-  P → D: ``PackReadyMsg``    — gather done, extent address and lease returned
-  D → P: ``ReadAckMsg``      — RDMA complete, P may release the lease
+  D → P: ``PrepareReadBatchMsg`` — request P to gather one whole window
+  P → D: ``PackReadyBatchMsg``   — every chunk ready, or the window rejected
+  D → P: ``ReadAckBatchMsg``     — RDMA complete, P may release the leases
 
 WRITE mode (layerwise connector — P initiates):
   P → D: ``PrepareWriteMsg`` — request D to allocate a staging extent
@@ -27,9 +27,7 @@ import msgspec
 
 
 class StagingMsgType(enum.IntEnum):
-    PREPARE_READ = 1
-    PACK_READY = 2
-    READ_ACK = 3
+    # 1, 2 and 3 were the retired single-chunk READ messages. Do not reuse them.
     CAPABILITY = 4
     ERROR = 5
     PREPARE_WRITE = 6
@@ -53,17 +51,6 @@ class PrepareReadMsg(msgspec.Struct, array_like=True):
     total_bytes: int
     release_source_when_ready: bool = False
     expected_chunks: int = 0
-
-
-class PackReadyMsg(msgspec.Struct, array_like=True):
-    """P -> D: gather complete, staging extent exposed for RDMA read."""
-
-    transfer_id: str
-    chunk_id: int
-    lease_id: int
-    staging_addr: int
-    payload_bytes: int
-    gather_ms: float = 0.0
 
 
 class ReadAckMsg(msgspec.Struct, array_like=True):
@@ -183,9 +170,6 @@ class WriteDoneMsg(msgspec.Struct, array_like=True):
 
 
 _MSG_TYPE_MAP: dict[StagingMsgType, type[msgspec.Struct]] = {
-    StagingMsgType.PREPARE_READ: PrepareReadMsg,
-    StagingMsgType.PACK_READY: PackReadyMsg,
-    StagingMsgType.READ_ACK: ReadAckMsg,
     StagingMsgType.PREPARE_READ_BATCH: PrepareReadBatchMsg,
     StagingMsgType.PACK_READY_BATCH: PackReadyBatchMsg,
     StagingMsgType.READ_ACK_BATCH: ReadAckBatchMsg,
@@ -235,7 +219,6 @@ def msg_type_of(data: bytes) -> StagingMsgType:
 __all__ = [
     "StagingMsgType",
     "PrepareReadMsg",
-    "PackReadyMsg",
     "ReadAckMsg",
     "PrepareReadBatchItem",
     "PrepareReadBatchMsg",
